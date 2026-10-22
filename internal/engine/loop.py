@@ -11,6 +11,7 @@ from internal.engine.reporter import Reporter
 from internal.provider.interface import LLMProvider
 from internal.schema.message import Message, Role, ToolCall, ToolDefinition
 from internal.tools.registry import Registry
+from internal.context.composer import PromptComposer
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +40,13 @@ class AgentEngine:
         work_dir: str,
         *,
         enable_thinking: bool = False,
+        composer: PromptComposer,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self.work_dir = work_dir
         self.enable_thinking = enable_thinking
+        self.composer = composer
 
     async def run(
         self,
@@ -57,8 +60,10 @@ class AgentEngine:
             self.enable_thinking,
         )
 
+        system_message = self.composer.build()
+
         history = [
-            Message(role=Role.SYSTEM, content=_SYSTEM_PROMPT),
+            system_message, # 注入动态组装的内核、AGENTS.md 与 Skills
             Message(role=Role.USER, content=user_prompt),
         ]
 
