@@ -1,4 +1,4 @@
-"""对外导出 schema 数据模型，便于 `from internal.schema import ...`。"""
+"""schema 包对外导出。"""
 
 from internal.schema.message import (
     Message,
