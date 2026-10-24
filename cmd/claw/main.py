@@ -24,11 +24,12 @@ if str(_ROOT) not in sys.path:
 load_dotenv(_ROOT / ".env")
 load_dotenv()
 
-from internal.context.composer import PromptComposer
 from internal.engine.loop import AgentEngine
+from internal.engine.session import global_session_mgr
 from internal.engine.terminal_reporter import TerminalReporter
 # from internal.feishu.bot import FeishuBot
 from internal.provider.openai import OpenAIProvider
+from internal.schema.message import Message, Role
 from internal.tools.bash import BashTool
 from internal.tools.edit_file import EditFileTool
 from internal.tools.read_file import ReadFileTool
@@ -41,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# # 飞书事件回调监听端口（HTTP 模式，与 Go 版保持一致）
+# # 飞书事件回调监听端口（HTTP 模式）
 # _PORT = 48080
 
 
@@ -50,7 +51,6 @@ def _build_engine() -> AgentEngine:
     if not os.getenv("ZHIPU_API_KEY"):
         raise SystemExit("请先设置 ZHIPU_API_KEY 环境变量")
 
-    # Go: workDir, _ := os.Getwd(); workDir += "/workspace"
     work_dir = str(Path.cwd() / "workspace")
     Path(work_dir).mkdir(parents=True, exist_ok=True)
 
@@ -63,15 +63,11 @@ def _build_engine() -> AgentEngine:
     registry.register(BashTool(work_dir))
     registry.register(EditFileTool(work_dir))
 
-    # 动态 System Prompt（内核 + AGENTS.md + Skills）
-    composer = PromptComposer(work_dir)
-
+    # work_dir / System Prompt 跟随 Session，不再挂在 Engine 上
     return AgentEngine(
         llm_provider,
         registry,
-        work_dir,
-        enable_thinking=True,
-        composer=composer,
+        enable_thinking=False,
     )
 
 
@@ -119,19 +115,37 @@ def _build_engine() -> AgentEngine:
 
 async def _async_main() -> None:
     """CLI：组装引擎，用 TerminalReporter 跑一次任务。"""
+    work_dir = str(Path.cwd() / "workspace")
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
+
     engine = _build_engine()
     # 【注入终端输出器】
     reporter = TerminalReporter()
 
+
+    # prompt = dedent(
+    #     """
+    #     我需要在当前目录下新建一个 ping.py，提供一个简单的 http ping 接口。
+    #     写完之后，帮我把代码用 git 提交一下。
+    #     """
+    # ).strip()
+
+    # 会话承载历史；用户输入先写入 Session，再唤醒引擎
+    sessionID = "test_oom_protection_001"
+    session = global_session_mgr.get_or_create(sessionID, work_dir)
+
+    # 发起一个会导致读取大文件的恶意任务 
     prompt = dedent(
         """
-        我需要在当前目录下新建一个 ping.py，提供一个简单的 http ping 接口。
-        写完之后，帮我把代码用 git 提交一下。
+        请帮我执行以下三个步骤： 
+        1. 使用 bash 执行 echo "开始排查日志" 
+        2. 使用 read_file 工具读取当前目录下的巨大文件 mock_log.txt 
+        3. 使用 bash 执行 date 命令获取当前时间，并告诉我任务全部完成。 
         """
     ).strip()
 
-    await engine.run(prompt, reporter)
-
+    session.append(Message(role=Role.USER, content=prompt))
+    await engine.run(session, reporter)
 
 def main() -> None:
     """启动 CLI 单次任务。"""

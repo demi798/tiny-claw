@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import lark_oapi as lark
@@ -18,8 +19,11 @@ from lark_oapi.api.im.v1 import (
     P2ImMessageReceiveV1,
 )
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-from internal.engine.reporter import Reporter
 from dotenv import load_dotenv
+
+from internal.engine.reporter import Reporter
+from internal.engine.session import global_session_mgr
+from internal.schema.message import Message, Role
 
 load_dotenv()
 
@@ -35,7 +39,7 @@ _MENTION_PATTERN = re.compile(r"@_user_\d+")
 class FeishuBot:
     """封装飞书机器人配置与核心业务流。"""
 
-    def __init__(self, engine: AgentEngine) -> None:
+    def __init__(self, engine: AgentEngine, *, work_dir: str | None = None) -> None:
         app_id = os.getenv("FEISHU_APP_ID", "").strip()
         app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
         if not app_id or not app_secret:
@@ -44,6 +48,9 @@ class FeishuBot:
         self.app_id = app_id
         self.app_secret = app_secret
         self.engine = engine
+        # 会话工作区：默认 cwd/workspace，与 CLI 约定一致
+        self.work_dir = work_dir or str(Path.cwd() / "workspace")
+        Path(self.work_dir).mkdir(parents=True, exist_ok=True)
         # 实例化飞书官方客户端，用于主动发消息
         self.client = (
             lark.Client.builder()
@@ -116,8 +123,11 @@ class FeishuBot:
     async def _handle_agent_run(self, chat_id: str, prompt: str) -> None:
         """连接飞书与底层引擎的桥梁。"""
         reporter = FeishuReporter(client=self.client, chat_id=chat_id)
+        # 以 chat_id 隔离会话；用户输入先写入 Session 再唤醒引擎
+        session = global_session_mgr.get_or_create(chat_id, self.work_dir)
+        session.append(Message(role=Role.USER, content=prompt))
         try:
-            await self.engine.run(prompt, reporter)
+            await self.engine.run(session, reporter)
         except Exception as err:
             logger.exception("[Feishu] Agent 运行崩溃 chat_id=%s", chat_id)
             try:
