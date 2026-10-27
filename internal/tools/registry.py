@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from internal.schema import ToolCall, ToolDefinition, ToolResult
 
 logger = logging.getLogger(__name__)
+
+# 中间件签名：接收当前 ToolCall，返回 (是否允许执行, 拦截原因)
+# 放行时 reject_reason 可为空字符串
+MiddlewareFunc = Callable[[ToolCall], tuple[bool, str]]
 
 
 class BaseTool(ABC):
@@ -47,6 +52,11 @@ class Registry(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def use(self, mw: MiddlewareFunc) -> None:
+        """【新增】挂载全局 Middleware。"""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_available_tools(self) -> list[ToolDefinition]:
         """返回当前已挂载工具的 Schema，供主循环交给 Provider。"""
         raise NotImplementedError
@@ -65,6 +75,8 @@ class ToolRegistry(Registry):
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
+        # 【新增】保存挂载的中间件链
+        self._middlewares: list[MiddlewareFunc] = []
 
     def register(self, tool: BaseTool) -> None:
         name = tool.name()
@@ -72,6 +84,10 @@ class ToolRegistry(Registry):
             logger.warning("工具 '%s' 已经被注册，将被覆盖。", name)
         self._tools[name] = tool
         logger.info("成功挂载工具: %s", name)
+
+    def use(self, mw: MiddlewareFunc) -> None:
+        """挂载全局 Middleware，按注册顺序在 Execute 前依次执行。"""
+        self._middlewares.append(mw)
 
     def get_available_tools(self) -> list[ToolDefinition]:
         return [tool.definition() for tool in self._tools.values()]
@@ -86,11 +102,27 @@ class ToolRegistry(Registry):
                 is_error=True,
             )
 
-        # 2. 将原始 JSON 字节交给具体工具
+        # 2. 【核心防御】执行底层逻辑前，依次运行所有 Middleware
+        for mw in self._middlewares:
+            allowed, reason = mw(call)
+            if not allowed:
+                logger.warning(
+                    "[Registry] ⚠️ 工具 %s 被 Middleware 拦截: %s",
+                    call.name,
+                    reason,
+                )
+                return ToolResult(
+                    tool_call_id=call.id,
+                    output=f"执行被系统拦截。原因: {reason}",
+                    # 必须返回 Error，强制大模型阅读拒绝理由
+                    is_error=True,
+                )
+
+        # 3. 所有 Middleware 放行后，将原始 JSON 字节交给具体工具
         try:
             output = await tool.execute(_to_args_bytes(call.arguments))
         except Exception as err:
-            # 3. 底层执行失败：封装后交还给主循环
+            # 底层执行失败：封装后交还给主循环
             return ToolResult(
                 tool_call_id=call.id,
                 output=f"Error executing {call.name}: {err}",

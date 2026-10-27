@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
+
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from internal.provider.interface import LLMProvider
 from internal.schema.message import Message, Role, ToolCall, ToolDefinition
 
+logger = logging.getLogger(__name__)
+
 _ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
 load_dotenv()
+
 
 class OpenAIProvider(LLMProvider):
     """基于 OpenAI 官方 SDK 的异步 Provider。"""
@@ -36,7 +41,7 @@ class OpenAIProvider(LLMProvider):
         messages: list[Message],
         available_tools: list[ToolDefinition] | None,
     ) -> Message | None:
-        openai_messages = _to_openai_messages(messages)
+        openai_messages = _sanitize_openai_messages(_to_openai_messages(messages))
         openai_tools = _to_openai_tools(available_tools or [])
 
         # 慢思考：无工具时不挂载 tools，迫使模型只输出纯文本
@@ -64,7 +69,7 @@ def _to_openai_messages(messages: list[Message]) -> list[dict[str, Any]]:
 
     for msg in messages:
         if msg.role == Role.SYSTEM:
-            result.append({"role": "system", "content": msg.content})
+            result.append({"role": "system", "content": msg.content or ""})
             continue
 
         if msg.role == Role.USER:
@@ -73,35 +78,158 @@ def _to_openai_messages(messages: list[Message]) -> list[dict[str, Any]]:
                 result.append(
                     {
                         "role": "tool",
-                        "content": msg.content,
+                        "content": msg.content or "",
                         "tool_call_id": msg.tool_call_id,
                     }
                 )
             else:
-                result.append({"role": "user", "content": msg.content})
+                result.append({"role": "user", "content": msg.content or ""})
             continue
 
         if msg.role == Role.ASSISTANT:
+            # 过滤 name 为空的畸形 tool_call，避免智谱 1214
+            valid_tool_calls = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": _arguments_to_str(tc.arguments),
+                    },
+                }
+                for tc in msg.tool_calls
+                if tc.name and tc.id
+            ]
             item: dict[str, Any] = {
                 "role": "assistant",
-                "content": msg.content or None,
+                # 智谱对 content=null 更挑剔，统一用空字符串
+                "content": msg.content or "",
             }
-            # 历史中的 tool_calls 必须原样回传，维系推理链
-            if msg.tool_calls:
-                item["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": _arguments_to_str(tc.arguments),
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ]
-            result.append(item)
+            if valid_tool_calls:
+                item["tool_calls"] = valid_tool_calls
+            # 无正文且无合法 tool_calls 的空 assistant 跳过
+            if item["content"] or item.get("tool_calls"):
+                result.append(item)
 
     return result
+
+
+def _sanitize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """校验并修复 messages，保证 tool 调用链完整，降低智谱 1214 风险。
+
+    规则：
+    1. role=tool 必须紧跟在带匹配 tool_calls 的 assistant 之后；
+    2. 丢弃孤儿 tool（找不到对应 tool_call_id）；
+    3. assistant 的 tool_calls 若缺少对应 tool 结果，则去掉无结果的 call；
+       若全部无结果，则降级为纯文本 assistant（有 content）或整段丢弃；
+    4. 不完整的尾部 assistant(tool_calls) 同样按上面规则处理。
+    """
+    sanitized: list[dict[str, Any]] = []
+    dropped = 0
+    i = 0
+    n = len(messages)
+
+    while i < n:
+        msg = messages[i]
+        role = msg.get("role")
+
+        if role in {"system", "user"}:
+            sanitized.append(msg)
+            i += 1
+            continue
+
+        if role == "tool":
+            # 孤儿 tool：前面没有配对的 assistant.tool_calls
+            dropped += 1
+            logger.warning(
+                "[Provider] 丢弃孤儿 tool 消息 tool_call_id=%s",
+                msg.get("tool_call_id"),
+            )
+            i += 1
+            continue
+
+        if role != "assistant":
+            dropped += 1
+            logger.warning("[Provider] 丢弃未知 role 消息: %s", role)
+            i += 1
+            continue
+
+        tool_calls = list(msg.get("tool_calls") or [])
+        if not tool_calls:
+            # 纯文本 assistant
+            sanitized.append(
+                {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                }
+            )
+            i += 1
+            continue
+
+        # 收集紧随其后的、且 id 命中的 tool 结果
+        expected_ids = {
+            tc.get("id")
+            for tc in tool_calls
+            if isinstance(tc, dict) and tc.get("id")
+        }
+        matched_tools: list[dict[str, Any]] = []
+        matched_ids: set[str] = set()
+        j = i + 1
+        while j < n and messages[j].get("role") == "tool":
+            tid = messages[j].get("tool_call_id")
+            if tid in expected_ids and tid not in matched_ids:
+                matched_tools.append(messages[j])
+                matched_ids.add(tid)
+            else:
+                # 不匹配或重复的 tool，跳过
+                dropped += 1
+                logger.warning(
+                    "[Provider] 丢弃无法配对的 tool 消息 tool_call_id=%s",
+                    tid,
+                )
+            j += 1
+
+        kept_calls = [
+            tc
+            for tc in tool_calls
+            if isinstance(tc, dict) and tc.get("id") in matched_ids
+        ]
+
+        if kept_calls and len(kept_calls) == len(matched_tools):
+            sanitized.append(
+                {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": kept_calls,
+                }
+            )
+            sanitized.extend(matched_tools)
+        else:
+            # 调用链不完整：有 content 则降级为纯文本，否则整段丢弃
+            content = msg.get("content") or ""
+            if content:
+                sanitized.append({"role": "assistant", "content": content})
+                logger.warning(
+                    "[Provider] tool_calls 链不完整，已降级为纯文本 assistant "
+                    "(期望 %d 个结果，实际配对 %d)",
+                    len(expected_ids),
+                    len(matched_ids),
+                )
+            else:
+                dropped += 1
+                logger.warning(
+                    "[Provider] 丢弃无正文且 tool_calls 不完整的 assistant"
+                )
+            # 已扫描过的 tool 段不再二次处理
+        i = j
+
+    if dropped:
+        logger.info(
+            "[Provider] messages 校验完成：丢弃/修复 %d 处，保留 %d 条",
+            dropped,
+            len(sanitized),
+        )
+    return sanitized
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -132,7 +260,9 @@ def _arguments_to_str(arguments: Any) -> str:
     if isinstance(arguments, (bytes, bytearray)):
         return arguments.decode("utf-8")
     if isinstance(arguments, str):
-        return arguments
+        return arguments if arguments else "{}"
+    if arguments is None:
+        return "{}"
     return json.dumps(arguments, ensure_ascii=False)
 
 
@@ -148,10 +278,15 @@ def _from_openai_message(choice_message: Any) -> Message:
         fn = getattr(tc, "function", None)
         if fn is None:
             continue
+        name = getattr(fn, "name", None)
+        if not name:
+            # 跳过 name 为空的畸形调用，避免写入 Session 后污染后续轮次
+            logger.warning("[Provider] 忽略 name 为空的 tool_call id=%s", getattr(tc, "id", None))
+            continue
         result.tool_calls.append(
             ToolCall(
                 id=tc.id,
-                name=fn.name,
+                name=name,
                 arguments=fn.arguments,
             )
         )

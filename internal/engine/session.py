@@ -31,6 +31,12 @@ class Session:
             # Append 到 work_dir/.claw/sessions/{id}.jsonl。
             # self.save_to_disk()
 
+    def clear(self) -> None:
+        """清空会话历史（演示入口避免旧拒绝话术污染）。"""
+        with self._lock:
+            self._history.clear()
+            self.updated_at = datetime.now()
+
     def get_working_memory(self, limit: int) -> list[Message]:
         """从后往前截取最近 N 条消息，形成 Agent 的短期工作记忆。
 

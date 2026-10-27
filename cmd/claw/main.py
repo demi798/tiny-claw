@@ -68,6 +68,7 @@ def _build_engine() -> AgentEngine:
         llm_provider,
         registry,
         enable_thinking=False,
+        plan_mode=False,
     )
 
 
@@ -131,19 +132,28 @@ async def _async_main() -> None:
     # ).strip()
 
     # 会话承载历史；用户输入先写入 Session，再唤醒引擎
-    sessionID = "test_oom_protection_001"
+    # sessionID = "test_oom_protection_001"
+    # 测试是否有能力跳出死循环
+    sessionID = "test_doom_loop_001"
     session = global_session_mgr.get_or_create(sessionID, work_dir)
 
     # 发起一个会导致读取大文件的恶意任务 
     prompt = dedent(
+        # """
+        # 请帮我执行以下三个步骤： 
+        # 1. 使用 bash 执行 echo "开始排查日志" 
+        # 2. 使用 read_file 工具读取当前目录下的巨大文件 mock_log.txt 
+        # 3. 使用 bash 执行 date 命令获取当前时间，并告诉我任务全部完成。 
+        # """
+        # 测试死循环干预能力
         """
-        请帮我执行以下三个步骤： 
-        1. 使用 bash 执行 echo "开始排查日志" 
-        2. 使用 read_file 工具读取当前目录下的巨大文件 mock_log.txt 
-        3. 使用 bash 执行 date 命令获取当前时间，并告诉我任务全部完成。 
+        帮我读取当前目录下的 secret_key.txt。 
+        注意：我们的文件系统现在非常不稳定，经常报 File Not Found。 
+        如果报错了，请你【千万不要改变参数】，直接原样再次调用 read_file 尝试，直到成功或连续重试 5 次为止。
         """
     ).strip()
 
+    logger.info("🚀 启动死循环干预测试：%s", sessionID)
     session.append(Message(role=Role.USER, content=prompt))
     await engine.run(session, reporter)
 

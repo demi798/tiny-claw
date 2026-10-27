@@ -117,7 +117,6 @@ async def _async_main() -> None:
         _run_session_b(engine, reporter),
     )
 
-
 def main() -> None:
     try:
         asyncio.run(_async_main())

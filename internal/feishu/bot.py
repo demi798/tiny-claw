@@ -18,11 +18,19 @@ from lark_oapi.api.im.v1 import (
     P2ImMessageMessageReadV1,
     P2ImMessageReceiveV1,
 )
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from dotenv import load_dotenv
 
 from internal.engine.reporter import Reporter
-from internal.engine.session import global_session_mgr
+from internal.engine.session import Session, global_session_mgr
+from internal.feishu.approval import (
+    build_approval_card,
+    global_approval_mgr,
+)
 from internal.schema.message import Message, Role
 
 load_dotenv()
@@ -39,7 +47,13 @@ _MENTION_PATTERN = re.compile(r"@_user_\d+")
 class FeishuBot:
     """封装飞书机器人配置与核心业务流。"""
 
-    def __init__(self, engine: AgentEngine, *, work_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        engine: AgentEngine,
+        session: Session | None = None,
+        *,
+        work_dir: str | None = None,
+    ) -> None:
         app_id = os.getenv("FEISHU_APP_ID", "").strip()
         app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
         if not app_id or not app_secret:
@@ -48,6 +62,10 @@ class FeishuBot:
         self.app_id = app_id
         self.app_secret = app_secret
         self.engine = engine
+        # 可选绑定固定 Session；未绑定时按 chat_id 隔离
+        self.sess = session
+        # 最近一次 Agent 运行绑定的 Reporter，供 Middleware 审批通知复用
+        self._reporter: FeishuReporter | None = None
         # 会话工作区：默认 cwd/workspace，与 CLI 约定一致
         self.work_dir = work_dir or str(Path.cwd() / "workspace")
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
@@ -78,10 +96,12 @@ class FeishuBot:
             verify_token = os.getenv("FEISHU_VERIFY_TOKEN", "")
 
         # Python SDK builder 参数顺序为 (encrypt_key, verification_token)
+        # 需同时订阅：im.message.receive_v1 + 回调 card.action.trigger
         return (
             lark.EventDispatcherHandler.builder(encrypt_key, verify_token)
             .register_p2_im_message_receive_v1(self._on_message_receive)
             .register_p2_im_message_message_read_v1(self._on_message_read)
+            .register_p2_card_action_trigger(self._on_card_action_trigger)
             .build()
         )
 
@@ -105,12 +125,99 @@ class FeishuBot:
 
         logger.info("[Feishu] 收到会话 %s 消息: %s", chat_id, content_str)
 
-        # 【驾驭并发】：绝不能阻塞事件回调，后台独立线程跑 Agent
+        # 【新增】拦截人工审批的特殊口令，唤醒挂起的引擎协程
+        if content_str.startswith("approve "):
+            task_id = content_str.removeprefix("approve ").strip()
+            global_approval_mgr.resolve_approval(
+                task_id,
+                True,
+                "人类管理员已批准操作",
+            )
+            logger.info("[Feishu] 会话 %s: ✅ 已为您批准任务 %s", chat_id, task_id)
+            return
+
+        if content_str.startswith("reject "):
+            task_id = content_str.removeprefix("reject ").strip()
+            global_approval_mgr.resolve_approval(
+                task_id,
+                False,
+                "人类管理员认为该操作存在极高风险，已无情拒绝",
+            )
+            logger.info("[Feishu] 会话 %s: 🚫 已拒绝任务 %s", chat_id, task_id)
+            return
+
+        # 非审批命令：正常对话，后台独立线程启动 Agent（绝不能阻塞事件回调）
         self._spawn_agent_run(chat_id, content_str)
 
     def _on_message_read(self, event: P2ImMessageMessageReadV1) -> None:
         """消息已读事件：静默忽略，避免日志干扰。"""
         return None
+
+    def _on_card_action_trigger(
+        self,
+        data: P2CardActionTrigger,
+    ) -> P2CardActionTriggerResponse:
+        """处理卡片回传交互（card.action.trigger）：通过 / 拒绝按钮。"""
+        logger.info("[Feishu] 收到卡片回调: %s", lark.JSON.marshal(data))
+
+        action = data.event.action if data.event is not None else None
+        value = (action.value or {}) if action is not None else {}
+        task_id = str(value.get("task_id", "")).strip()
+        decision = str(value.get("action", "")).strip().lower()
+
+        if not task_id or decision not in {"approve", "reject"}:
+            return P2CardActionTriggerResponse(
+                {
+                    "toast": {
+                        "type": "error",
+                        "content": "无法识别的审批操作",
+                    }
+                }
+            )
+
+        allowed = decision == "approve"
+        reason = (
+            "人类管理员已批准操作"
+            if allowed
+            else "人类管理员认为该操作存在极高风险，已无情拒绝"
+        )
+        global_approval_mgr.resolve_approval(task_id, allowed, reason)
+        logger.info(
+            "[Feishu] 卡片审批 TaskID=%s allowed=%s",
+            task_id,
+            allowed,
+        )
+
+        # 回写卡片：去掉按钮并展示结果，避免重复点击
+        tool_name = str(value.get("tool_name", "unknown"))
+        args = str(value.get("args", ""))
+        updated_card = build_approval_card(
+            task_id,
+            tool_name,
+            args,
+            resolved=True,
+            allowed=allowed,
+        )
+        return P2CardActionTriggerResponse(
+            {
+                "toast": {
+                    "type": "success" if allowed else "info",
+                    "content": (
+                        f"✅ 已批准任务 {task_id}"
+                        if allowed
+                        else f"🚫 已拒绝任务 {task_id}"
+                    ),
+                },
+                "card": {
+                    "type": "raw",
+                    "data": updated_card,
+                },
+            }
+        )
+
+    def reporter(self) -> FeishuReporter | None:
+        """返回 FeishuBot 当前绑定的 Reporter（供审批 Middleware 发通知）。"""
+        return self._reporter
 
     def _spawn_agent_run(self, chat_id: str, prompt: str) -> None:
         """在独立线程中启动 Agent，避免占用飞书长连接的事件循环。"""
@@ -123,8 +230,14 @@ class FeishuBot:
     async def _handle_agent_run(self, chat_id: str, prompt: str) -> None:
         """连接飞书与底层引擎的桥梁。"""
         reporter = FeishuReporter(client=self.client, chat_id=chat_id)
-        # 以 chat_id 隔离会话；用户输入先写入 Session 再唤醒引擎
-        session = global_session_mgr.get_or_create(chat_id, self.work_dir)
+        # 绑定本轮 Reporter，便于 Middleware 发起审批通知
+        self._reporter = reporter
+
+        # 优先使用构造时绑定的 Session；否则按 chat_id 隔离
+        session = self.sess or global_session_mgr.get_or_create(
+            chat_id,
+            self.work_dir,
+        )
         session.append(Message(role=Role.USER, content=prompt))
         try:
             await self.engine.run(session, reporter)
@@ -147,13 +260,28 @@ class FeishuReporter(Reporter):
     async def send_msg(self, text: str) -> None:
         """调用飞书 OpenAPI 发送文本消息。"""
         content_str = json.dumps({"text": text}, ensure_ascii=False)
+        await self._create_message("text", content_str)
+
+    async def send_approval_card(
+        self,
+        task_id: str,
+        tool_name: str,
+        args: str,
+    ) -> None:
+        """发送带「通过 / 拒绝」按钮的审批交互卡片。"""
+        card = build_approval_card(task_id, tool_name, args)
+        content_str = json.dumps(card, ensure_ascii=False)
+        await self._create_message("interactive", content_str)
+
+    async def _create_message(self, msg_type: str, content_str: str) -> None:
+        """底层发消息封装。"""
         request = (
             CreateMessageRequest.builder()
             .receive_id_type("chat_id")
             .request_body(
                 CreateMessageRequestBody.builder()
                 .receive_id(self._chat_id)
-                .msg_type("text")
+                .msg_type(msg_type)
                 .content(content_str)
                 .build()
             )
@@ -163,10 +291,14 @@ class FeishuReporter(Reporter):
         response = await asyncio.to_thread(self._client.im.v1.message.create, request)
         if not response.success():
             logger.error(
-                "[Feishu] 发送消息失败 code=%s msg=%s log_id=%s",
+                "[Feishu] 发送消息失败 type=%s code=%s msg=%s log_id=%s",
+                msg_type,
                 response.code,
                 response.msg,
                 response.get_log_id(),
+            )
+            raise RuntimeError(
+                f"飞书发送失败 code={response.code} msg={response.msg}"
             )
 
     async def on_thinking(self) -> None:
