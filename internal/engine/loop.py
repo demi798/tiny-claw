@@ -28,6 +28,19 @@ _REPORTER_OUTPUT_LIMIT = 200
 # 短期工作记忆条数：给压缩器留足判断空间
 _WORKING_MEMORY_LIMIT = 20
 
+# 子智能体最多轮次，防止自己卡死
+_MAX_SUB_TURNS = 10
+
+# 探路者 System Prompt：严厉要求必须用工具、禁止空想
+_SUBAGENT_SYSTEM_PROMPT = """你是一个专门负责深度探索的探路者 (Explorer Subagent)。
+你的任务是根据主架构师的指令，在当前工作区内仔细阅读代码、查阅日志，搜集足够的信息。
+
+【核心纪律】
+1. 你必须、且只能依靠内置工具（如 bash 的 find/grep，或 read_file）去寻找答案。绝对不允许凭空捏造或猜测！
+2. 如果你没有找到确切的答案，你必须继续使用工具深入搜索。
+3. 当且仅当你找到了确切的线索后，停止调用工具，直接输出一段纯文本作为你的终极汇报。主架构师会根据你的汇报来做下一步决策。
+"""
+
 
 class AgentEngine:
     """驱动 Agent 生命周期：可选慢思考，再行动并执行工具。
@@ -130,6 +143,89 @@ class AgentEngine:
             # ================= 执行工具并注入自愈模板 =================
             await self._run_observations(session, action.tool_calls, reporter)
 
+    async def run_sub(
+        self,
+        task_prompt: str,
+        read_only_registry: Registry,
+        reporter: Reporter | Any | None = None,
+    ) -> str:
+        """专为 Subagent 拉起的一次性受限循环：不依赖外部 Session，打完就跑。
+
+        Reporter 透传自主线程，工具名加 [Subagent] 前缀便于终端区分轨迹。
+        强制关闭慢思考，仅使用传入的只读工具注册表。
+        """
+        # reporter 可能来自 tools 包的 Any；尽量按 Reporter 使用
+        typed_reporter: Reporter | None = (
+            reporter if isinstance(reporter, Reporter) else None
+        )
+
+        context_history: list[Message] = [
+            Message(role=Role.SYSTEM, content=_SUBAGENT_SYSTEM_PROMPT),
+            Message(role=Role.USER, content=task_prompt),
+        ]
+
+        turn_count = 0
+        while True:
+            turn_count += 1
+            if turn_count > _MAX_SUB_TURNS:
+                raise RuntimeError(
+                    f"子智能体探索过于深入，超过 {_MAX_SUB_TURNS} 轮被强制召回，"
+                    "请主 Agent 给它更明确的指令"
+                )
+
+            # 【驾驭底线】：仅获取传入的只读工具注册表
+            available_tools = read_only_registry.get_available_tools()
+            compacted_context = self.compactor.compact(context_history)
+
+            # 子任务急速响应：强制关闭慢思考，直接预测行动
+            try:
+                action = await self._generate(
+                    compacted_context,
+                    tools=available_tools,
+                    stage="Subagent-Action",
+                )
+            except Exception as err:
+                raise RuntimeError("子智能体推理失败") from err
+
+            context_history.append(action)
+
+            # 【核心退出条件】：不再调用工具 → 纯文本汇报返回上层
+            if not action.tool_calls:
+                return action.content
+
+            # 执行只读工具（与 Go 一致：并发）；结果仅写入本地 contextHistory
+            observation_msgs = await self._execute_sub_tools(
+                action.tool_calls,
+                read_only_registry,
+                typed_reporter,
+            )
+            context_history.extend(observation_msgs)
+
+    async def _execute_sub_tools(
+        self,
+        tool_calls: list[ToolCall],
+        registry: Registry,
+        reporter: Reporter | None,
+    ) -> list[Message]:
+        """子智能体工具执行：并发跑只读工具，Reporter 带 [Subagent] 前缀。"""
+        pairs: list[tuple[Message, ToolResult] | None] = [None] * len(tool_calls)
+
+        async def _run_one(idx: int, call: ToolCall) -> None:
+            pairs[idx] = await self._execute_one_tool(
+                idx,
+                call,
+                reporter,
+                registry=registry,
+                tool_name_prefix="[Subagent] ",
+            )
+
+        await asyncio.gather(
+            *(_run_one(i, call) for i, call in enumerate(tool_calls))
+        )
+        if any(item is None for item in pairs):
+            raise RuntimeError("子智能体并行工具执行后观察结果不完整")
+        return [msg for msg, _ in pairs if msg is not None]
+
     async def _run_thinking(
         self,
         compacted_context: list[Message],
@@ -224,18 +320,25 @@ class AgentEngine:
         idx: int,
         call: ToolCall,
         reporter: Reporter | None,
+        *,
+        registry: Registry | None = None,
+        tool_name_prefix: str = "",
     ) -> tuple[Message, ToolResult]:
         """执行单个工具；失败时经 RecoveryManager 注入救援指南。
 
         返回 (Observation 消息, 原始 ToolResult)，原始结果供 Reminder 分析 IsError。
+        registry 默认用引擎主注册表；子智能体可传入只读注册表。
+        tool_name_prefix 用于 Reporter 展示（如 "[Subagent] "）。
         """
+        active_registry = registry if registry is not None else self._registry
+        display_name = f"{tool_name_prefix}{call.name}"
         args_text = _format_arguments(call.arguments)
-        logger.info("  -> [Task-%d] 执行工具: %s args=%s", idx, call.name, args_text)
+        logger.info("  -> [Task-%d] 执行工具: %s args=%s", idx, display_name, args_text)
 
         if reporter is not None:
-            await reporter.on_tool_call(call.name, args_text)
+            await reporter.on_tool_call(display_name, args_text)
 
-        result = await self._registry.execute(call)
+        result = await active_registry.execute(call)
 
         # 【核心拦截与注入】错误结果交给 Recovery 增强后再进上下文
         final_output = result.output
@@ -246,13 +349,13 @@ class AgentEngine:
             logger.info(
                 "  -> [Task-%d] ✅ 工具成功 %s，返回 %d 字节",
                 idx,
-                call.name,
+                display_name,
                 len(result.output),
             )
 
         if reporter is not None:
             await reporter.on_tool_result(
-                call.name,
+                display_name,
                 _truncate_for_reporter(final_output),
                 is_error=result.is_error,
             )
