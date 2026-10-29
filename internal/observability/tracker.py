@@ -25,6 +25,8 @@ class _ModelPrice:
 PRICING_MODEL: dict[str, _ModelPrice] = {
     # 本仓库默认模型，沿用同档估价便于演示账单
     "glm-4.6v": _ModelPrice(input_price=0.15, output_price=0.15),
+    # Benchmark 跑分常用廉价档
+    "glm-4.5-air": _ModelPrice(input_price=0.15, output_price=0.15),
 }
 
 

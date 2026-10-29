@@ -18,6 +18,7 @@
 | Reminder 死循环打断 | 同指纹连续**失败**或连续**成功** ≥3 次，注入 `Role.USER` 强力 Reminder | ✅ |
 | CostTracker 账单 | Provider 装饰器提取 Usage，累加 Session Token / 费用 | ✅ |
 | Tracing 链路追踪 | `contextvars` 挂载 Span；`Agent.Run` → `Turn-N` → `LLM.*` / `Tool.Execute`；导出 JSON | ✅ |
+| Harness Benchmark | 隔离沙箱 + Setup/Task/Validate；`CostTracker` 记账；汇总通过率与成本 | ✅ |
 | Plan Mode | 进度外部化到 `PLAN.md` / `TODO.md`，支持断点续传 | ✅ |
 | Approval Gate | System Prompt 要求原样调工具，安全交给 Middleware + 人类 | ✅ |
 | Registry Middleware | `registry.use(mw)`：执行前拦截；可挂人工审批 | ✅ |
@@ -75,6 +76,7 @@
 - **Reminder**：同指纹连续失败 **或** 连续成功 ≥3 次，追加 User 级打断消息。
 - **CostTracker**：装饰 LLMProvider，按模型单价把 Usage 写入 Session。
 - **Tracing**：用 `contextvars` 模拟 Go `context.Context` 挂载 Span；父子自动绑定；结束导出 JSON。
+- **Benchmark**：每用例独立 `workspace/{id}_{ts}/` 沙箱；Setup → Agent → Validate（exit 0 算过）；账单记在独立 Session。
 - **Middleware**：工具真正执行前可拦截；高危命令可挂起等待人类审批。
 - **Approval Gate**：提示模型勿口头拒答，安全由中间件 + 人类把关。
 - **Subagent**：主 Agent 通过 `spawn_subagent` 委派；子循环不写主 Session，只回摘要。
@@ -88,8 +90,11 @@
 
 ```text
 tiny-claw/
-├── cmd/claw/
-│   └── main.py                   # 统一演示入口（注释切换各 demo_*）
+├── cmd/
+│   ├── claw/
+│   │   └── main.py               # 统一演示入口（注释切换各 demo_*）
+│   └── bench/
+│       └── main.py               # Harness Benchmark 跑分入口
 ├── AGENTS.md
 ├── .claw/skills/
 │   └── git-workflow/SKILL.md
@@ -101,6 +106,8 @@ tiny-claw/
 │   ├── PLAN.md / TODO.md
 │   ├── trace_test.md             # Tracing 演示写入产物
 │   ├── .claw/traces/             # Trace JSON 导出目录
+│   ├── test_001_edit_*/          # Benchmark 隔离沙箱（按用例生成）
+│   ├── test_002_code_gen_*/
 │   └── …
 ├── mock_log.txt
 ├── tmp/
@@ -118,6 +125,8 @@ tiny-claw/
 │   │   ├── skill.py
 │   │   ├── compactor.py
 │   │   └── recovery.py
+│   ├── eval/
+│   │   └── benchmark.py          # TestCase / TestResult / BenchmarkRunner
 │   ├── observability/
 │   │   ├── tracker.py            # CostTracker 账单装饰器
 │   │   └── trace.py              # Span + contextvars + 导出 JSON
@@ -295,6 +304,26 @@ python cmd/claw/main.py
 
 > 引擎对含 `bash` / 写操作会整批串行；Trace 仍会记录多个平级（或顺序）的 `Tool.Execute`。
 
+### 9. Harness Benchmark 跑分
+
+独立入口（不走 `cmd/claw/main.py` 注释切换）：
+
+```bash
+python cmd/bench/main.py
+```
+
+| 用例 | 靶机 Setup | 任务 | 判卷 |
+| --- | --- | --- | --- |
+| `test_001_edit` | 写出 `config.json`（version=v1.0.0） | `edit_file` 改为 v2.0.0 | `grep` 检查版本号 |
+| `test_002_code_gen` | 写出 `mathutil.py`（`multiply`） | 编写 `test_mathutil.py`（unittest） | `python -m unittest …` |
+
+| 项 | 说明 |
+| --- | --- |
+| 模型 | 默认 `glm-4.6v`（见 `cmd/bench/main.py` 内 `_BENCH_MODEL`） |
+| 沙箱 | `workspace/{case_id}_{unix_ts}/`，用例间物理隔离 |
+| 账单 | 每用例独立 `Session` + `CostTracker` |
+| 报告 | 终端打印通过数 / 成功率 / 累计成本（CNY） |
+
 ---
 
 ## Working Memory 行为摘要
@@ -392,6 +421,19 @@ Agent.Run
 
 ---
 
+## Benchmark 行为摘要
+
+`BenchmarkRunner`（`internal/eval/benchmark.py`）：
+
+1. `run_suite(testcases)`：串行执行用例，汇总 `TestResult` 并打印终极报告
+2. 单用例流程：`mkdir` 沙箱 → 可选 `setup_script` → `CostTracker` 包装引擎（四工具）→ `engine.run(session, reporter=None)` → `validate_script`（exit 0 通过）
+3. `TestCase`：`id` / `name` / `task_prompt` / `validate_script` / 可选 `setup_script` / `max_turns`（字段已留，限轮尚未接入引擎）
+4. `TestResult`：`passed` / `total_cost_cny` / `duration_ms` / `error_msg`
+
+入口：`cmd/bench/main.py` 组装微型评测集并调用 `new_benchmark_runner(model).run_suite(...)`。
+
+---
+
 ## Middleware / 人工审批摘要
 
 `Registry.use(mw)` → `Execute` 前依次调用；`allowed=False` 时返回 `is_error=True` 及原因。
@@ -461,6 +503,8 @@ engine.run（主线）
 | Reminder 死循环干预 | 同指纹失败或成功 ≥3（日志含「成功死循环干预」） |
 | `.claw/traces` 无文件 | 未跑完 `engine.run`（未进 finally）；或 `work_dir` 不对 |
 | Trace 里 Turn 互相嵌套 | 旧版未每轮 `end_span`；现已 `try/finally` 按轮结束 |
+| Benchmark「靶机 Setup 失败」 | `setup_script` 在沙箱 cwd 执行失败；检查 bash / 引号 |
+| Benchmark 验证脚本失败 | Agent 未改对文件，或 unittest/grep 断言不匹配；看沙箱目录产物 |
 | 子智能体找不到密码 | `workspace` 下缺少 `config.txt`，或未走 `spawn_subagent` |
 | 子智能体超 10 轮被召回 | 任务指令过宽；请主 Agent 给出更明确的 `task_prompt` |
 | `git push` 连不上 github.com | 本机网络/代理问题，与仓库无关 |
@@ -497,6 +541,10 @@ engine.run（主线）
 ### Trace（`internal/observability/trace.py`）
 
 见上文「Tracing 行为摘要」。
+
+### Benchmark（`internal/eval/benchmark.py`）
+
+见上文「Benchmark 行为摘要」。入口：`cmd/bench/main.py`。
 
 ### Registry（`internal/tools/registry.py`）
 
@@ -535,6 +583,7 @@ engine.run（主线）
 
 | 日期 | 版本 / 标签 | 摘要 |
 | --- | --- | --- |
+| 2026-10-29 | — | Harness Benchmark：`eval/benchmark.py` + `cmd/bench/main.py`；隔离沙箱 Setup/Validate；Python 用例 |
 | 2026-10-29 | — | Tracing：`trace.py` + loop/registry 埋点；导出 `.claw/traces`；`demo_trace` |
 | 2026-10-29 | — | WM 按回合裁剪 + User 首条防 1214；Reminder 覆盖「成功死循环」；CostTracker / Usage；演示入口合并为 `main.py` |
 | 2026-10-28 | — | Subagent：`spawn_subagent` + `AgentEngine.run_sub` 只读探路者 |
@@ -549,6 +598,11 @@ engine.run（主线）
 ### 迭代备注（自由文本）
 
 ```text
+# 2026-10-29（Harness Benchmark）
+# - eval/benchmark.py：TestCase / TestResult / BenchmarkRunner
+# - 隔离沙箱 + Setup → Agent(+CostTracker) → Validate；汇总通过率/成本
+# - cmd/bench/main.py：test_001_edit（edit_file）+ test_002_code_gen（unittest）
+
 # 2026-10-29（Tracing）
 # - observability/trace.py：Span + contextvars + export_trace_to_file
 # - loop.run：Agent.Run / Turn-N / LLM.Thinking|Action；finally 导出
@@ -598,8 +652,10 @@ engine.run（主线）
 - [x] WM 回合裁剪 + User 首条（防 1214）
 - [x] CostTracker / Usage 账单
 - [x] Tracing：contextvars Span + JSON 导出
+- [x] Harness Benchmark：隔离沙箱 + Setup/Validate 跑分
 - [x] Middleware + 飞书人工审批卡片
 - [x] Subagent：只读探路者 + 摘要回流
+- [ ] Benchmark `max_turns` 接入引擎限轮
 - [ ] `internal/memory` 跨会话长期记忆
 - [ ] Provider 429/超时重试
 - [ ] 更多 Reporter
