@@ -30,7 +30,8 @@
 | 并发策略 | 只读工具可并行；含写操作或 bash 时整批串行 | ✅ |
 | Provider 清洗 | 消息链 sanitize + system 后强制 User 首条，降低智谱 `1214` | ✅ |
 | Reporter | 统一输出契约；终端 / 飞书实现 | ✅ |
-| 统一演示入口 | `cmd/claw/main.py`：CLI / Session / Plan / Recovery / 飞书 / Subagent / 账单 / Tracing（注释互斥切换） | ✅ |
+| CLI 入口 | `cmd/claw/main.py`：`-p` 任务 + 可选 `-d`/`-s`；默认 `plan_mode` + CostTracker + Tracing | ✅ |
+| 场景演示入口 | `cmd/claw/main_case.py`：各 `demo_*` 注释互斥（Session / Recovery / 飞书 / Subagent 等） | ✅ |
 | 多渠道（钉钉 / WebUI 等） | 可基于 Reporter 扩展 | 📋 |
 
 ---
@@ -74,7 +75,7 @@
 - **Recovery**：工具 `IsError` 时增强 stderr，引导改主意。
 - **Reminder**：同指纹连续失败 ≥3 **或** 连续成功 ≥8 次，追加 User 级打断消息。
 - **CostTracker**：装饰 LLMProvider，按模型单价把 Usage 写入 Session。
-- **Tracing**：用 `contextvars` 模拟 Go `context.Context` 挂载 Span；父子自动绑定；结束导出 JSON。
+- **Tracing**：用 `contextvars` 挂载 Span；父子自动绑定；结束导出 JSON。
 - **Benchmark**：每用例独立 `workspace/{id}_{ts}/` 沙箱；Setup → Agent → Validate（exit 0 算过）；账单记在独立 Session。
 - **Middleware**：工具真正执行前可拦截；高危命令可挂起等待人类审批。
 - **Approval Gate**：提示模型勿口头拒答，安全由中间件 + 人类把关。
@@ -91,7 +92,8 @@
 tiny-claw/
 ├── cmd/
 │   ├── claw/
-│   │   └── main.py               # 统一演示入口（注释切换各 demo_*）
+│   │   ├── main.py               # 正式 CLI：-p / -d / -s；Plan Mode + 账单 + Trace
+│   │   └── main_case.py           # 场景演示：注释互斥切换各 demo_*
 │   └── bench/
 │       └── main.py               # Harness Benchmark 跑分入口
 ├── workspace/                    # 默认工作区（.gitignore）
@@ -149,7 +151,7 @@ pip install openai python-dotenv lark-oapi flask
 # 大模型（智谱 OpenAI 兼容）
 ZHIPU_API_KEY=your_zhipu_api_key
 
-# 飞书（demo_feishu_approval / 飞书 Bot 需要）
+# 飞书（main_case.demo_feishu_approval / 飞书 Bot 需要）
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_ENCRYPT_KEY=xxx          # 仅 HTTP 回调需要；长连接可空
@@ -160,139 +162,66 @@ FEISHU_VERIFY_TOKEN=xxx
 
 ## 快速启动
 
-所有演示已合并到 **`cmd/claw/main.py`**。在 `main()` 里**一次只取消注释一个** `demo_*`（互斥）。
+正式 CLI 入口是 **`cmd/claw/main.py`**（需 `-p`）。专题场景（双 Session / Recovery / 飞书审批 / Subagent 等）见 **`cmd/claw/main_case.py`**，在其 `main()` 里一次只取消注释一个 `demo_*`。
 
-让 `AGENTS.md` / Skills 生效时放到 **work_dir**：
+让 `AGENTS.md` / Skills 生效时放到 **work_dir**（默认可用 `workspace/`）：
 
 ```bash
 cp AGENTS.md workspace/
 mkdir -p workspace/.claw/skills && cp -R .claw/skills/* workspace/.claw/skills/
 ```
 
-### 1. CLI / Compactor（OOM） / Reminder
-
-启用 `demo_cli()`：
+### 1. CLI（`cmd/claw/main.py`）
 
 ```bash
 cd tiny-claw
-cp -f mock_log.txt workspace/   # 若已在 workspace/ 可跳过
-python cmd/claw/main.py
-```
-
-源码内 prompt 可切换压缩 / 死循环干预等任务。
-
-### 2. Session / 记忆截断演示
-
-启用 `demo_session_isolation()`：
-
-```bash
-python cmd/claw/main.py
-```
-
-| 会话 | 目的 |
-| --- | --- |
-| Session A（`tmp/project_front`） | 读密钥 → 刷闲聊挤出 Working Memory → 再追问 |
-| Session B（`tmp/project_back`） | 验证跨会话隔离 |
-
-### 3. Plan Mode 演示（当前默认常开）
-
-启用 `demo_plan_mode`（需 `-p`）：
-
-```bash
 python cmd/claw/main.py -p "在 workspace 里搭一个简单的静态页服务"
+# 指定工作区与会话（可选）
+python cmd/claw/main.py -p "修复 test.py 的并发问题" -d ./workspace -s cli_default_session
 ```
 
-| 项 | 说明 |
+| 参数 | 说明 |
 | --- | --- |
-| Session | `task_web_server_001` |
-| 引擎 | `plan_mode=True` |
-| 外部化 | 默认 `PLAN.md` / `TODO.md`；旧任务未完成且开新任务 → `PLAN{N}.md` / `TODO{N}.md`；旧任务全勾完 → 删旧覆盖 |
+| `-p` / `--prompt` | **必填**，交给 Agent 的任务描述 |
+| `-d` / `--dir` | 工作区目录（默认 `.`，建议显式传 `./workspace`） |
+| `-s` / `--session` | 会话 ID（默认 `cli_default_session`，可断点续传） |
 
-### 4. Recovery 自愈演示
+| 项 | 当前默认装配 |
+| --- | --- |
+| 模型 | `glm-4.6v`（`_MODEL`） |
+| 引擎 | `enable_thinking=False`，`plan_mode=True` |
+| 工具 | `read_file` / `write_file` / `edit_file` / `bash`（无飞书审批 Middleware、无 `spawn_subagent`） |
+| 账单 | `CostTracker` 装饰 Provider；结束打印 Session 累计 Token / CNY |
+| 追踪 | CLI Root Span `CLI.TaskRun` + 引擎内 `Agent.Run`；结束导出 `{work_dir}/.claw/traces/trace_*.json` |
+| Plan Mode | 默认对 `PLAN.md` / `TODO.md`；未完成新开任务 → `PLAN{N}.md` / `TODO{N}.md`；已完成 → 删旧覆盖 |
+| Reminder / Recovery / Compactor | 由 `AgentEngine` 内部自动装配 |
 
-启用 `demo_recovery()`：
+> 环境变量需已设置 `ZHIPU_API_KEY`（见上文「配置」）。
+
+### 2. 场景演示（`cmd/claw/main_case.py`，可选）
+
+不走 CLI 参数，而是在 `main_case.py` 的 `main()` 里**注释互斥**启用某一个 `demo_*`：
 
 ```bash
-python cmd/claw/main.py
+python cmd/claw/main_case.py
 ```
 
-| 项 | 说明 |
+| 演示函数 | 用途 |
 | --- | --- |
-| Session | `test_recovery_001` |
-| 陷阱 | 直接 `edit_file` 改 `auth.py`，诱发 `old_text` 不匹配 |
-| 预期 | Recovery 注入指南 → 先 `read_file` 再重试 |
+| `demo_cli` | CLI / Compactor / Reminder 等源码内 prompt 切换 |
+| `demo_session_isolation` | 双会话 WM：`tmp/project_front` vs `tmp/project_back` |
+| `demo_plan_mode` | Plan Mode（另需解析 `-p`，见文件内 `_parse_plan_args`） |
+| `demo_recovery` | 故意 `edit_file` 失配 → Recovery 注入后再 `read_file` |
+| `demo_feishu_approval` | 飞书高危审批（**不要**包 `asyncio.run`）；需飞书环境变量 |
+| `demo_subagent` | `spawn_subagent` 找 `config.txt`，主线写 `answer.txt` |
+| `demo_observability` | 账单仪表盘专项 |
+| `demo_trace` | Tracing 专项（当前文件默认常开此项） |
 
-### 5. 飞书高危审批演示（长连接）
+飞书审批开放平台请确认：长连接 + `im.message.receive_v1`；卡片回传 `card.action.trigger`；改配置后发版。
 
-启用 `demo_feishu_approval()`（**不要**包 `asyncio.run`）：
+### 3. Harness Benchmark 跑分
 
-```bash
-python cmd/claw/main.py
-```
-
-| 项 | 说明 |
-| --- | --- |
-| Session | `test_command_intercept_001`（启动时 `clear()`） |
-| 引擎 | `approval_gate=True` |
-| Middleware | `is_dangerous_command` 命中后 `wait_for_approval` |
-| 交互 | 飞书发「通过 / 拒绝」卡片；也可用 `approve <id>` / `reject <id>` |
-
-开放平台请确认：
-
-1. 事件：长连接 + `im.message.receive_v1`
-2. 回调：长连接接收回调 + **卡片回传交互** `card.action.trigger`
-3. 权限含发消息；改配置后**发版**
-
-### 6. Subagent 多智能体协同演示
-
-启用 `demo_subagent()`：
-
-```bash
-# 请先在 workspace 某路径下放好 config.txt（内含「核心密码」）
-python cmd/claw/main.py
-```
-
-| 项 | 说明 |
-| --- | --- |
-| Session | `test_subagent_001` |
-| 只读沙箱 | 子智能体仅 `read_file` + `bash` |
-| 主线工具 | 四大工具 + `spawn_subagent`（注入 `engine` + 只读 Registry） |
-| 任务 | 委派子智能体找 `config.txt` → 主 Agent `write_file` 写 `answer.txt` |
-| 预期 | 终端可见 `[Subagent]` 工具轨迹；主上下文只收到探索报告 |
-
-### 7. CostTracker 账单演示
-
-启用 `demo_observability()`：
-
-```bash
-python cmd/claw/main.py
-```
-
-| 项 | 说明 |
-| --- | --- |
-| 装饰 | `CostTracker(provider, model, session)` |
-| 预期 | 跑完打印 Session 累计 Input/Output Tokens 与 CNY 费用 |
-
-### 8. Tracing 链路追踪演示
-
-启用 `demo_trace()`：
-
-```bash
-python cmd/claw/main.py
-```
-
-| 项 | 说明 |
-| --- | --- |
-| Session | `test_trace_001` |
-| 工具 | 仅 `bash` + `write_file` |
-| 任务 | 一轮内分别调用 sleep 检查与写入 `trace_test.md` |
-| 预期 | `{work_dir}/.claw/traces/trace_*.json`；树形含 `Agent.Run` / `Turn-N` / `LLM.Action` / `Tool.Execute` |
-
-> 引擎对含 `bash` / 写操作会整批串行；Trace 仍会记录多个平级（或顺序）的 `Tool.Execute`。
-
-### 9. Harness Benchmark 跑分
-
-独立入口（不走 `cmd/claw/main.py` 注释切换）：
+独立入口（与 `main.py` / `main_case.py` 无关）：
 
 ```bash
 python cmd/bench/main.py
@@ -380,7 +309,7 @@ python cmd/bench/main.py
 
 ## Tracing 行为摘要
 
-对应 Go 的 `context.Context` 挂 Span：Python 用 `contextvars.ContextVar` 透传当前 Span。
+使用 `contextvars.ContextVar` 透传当前 Span。
 
 | API | 作用 |
 | --- | --- |
@@ -466,7 +395,7 @@ engine.run（主线）
 
 要点：
 
-- `AgentRunner` Protocol 打破 `tools` ↔ `engine` 循环依赖；`demo_subagent` 把主引擎注入为 runner
+- `AgentRunner` Protocol 打破 `tools` ↔ `engine` 循环依赖；`main_case.demo_subagent` 把主引擎注入为 runner
 - 子循环**不依赖**外部 Session，打完即弃；失败时把错误文案当 Observation 交回主 Agent
 - 成功返回形如 `【子智能体探索报告】:\n...`
 
@@ -474,7 +403,7 @@ engine.run（主线）
 
 ## 飞书模式
 
-- 在 `main.py` 启用 `demo_feishu_approval()`：WebSocket 长连接 + 审批卡片
+- 在 `main_case.py` 启用 `demo_feishu_approval()`：WebSocket 长连接 + 审批卡片
 - `FeishuBot`：可绑定固定 Session；处理文本审批口令与 `card.action.trigger`
 
 ### 常见问题
@@ -640,7 +569,7 @@ engine.run（主线）
 ## 路线图
 
 - [ ] `requirements.txt` / `pyproject.toml`
-- [ ] CLI / 飞书 / 演示入口用启动参数切换（当前靠 `main()` 注释互斥）
+- [ ] 飞书 / 专题演示并入 CLI 启动参数（当前：`main.py` 管通用任务，`main_case.py` 靠注释互斥）
 - [ ] Session 历史 JSONL 落盘
 - [ ] Compactor / WM 阈值可配置或按 token 预算
 - [x] Recovery：工具失败特征救援

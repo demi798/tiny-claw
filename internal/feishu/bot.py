@@ -8,6 +8,8 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Callable
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -43,14 +45,41 @@ logger = logging.getLogger(__name__)
 # 飞书群聊 @ 机器人时常见的占位符，例如 @_user_1
 _MENTION_PATTERN = re.compile(r"@_user_\d+")
 
+# ==========================================
+# 1. Context 传递：解决并发 Reporter 串发
+# ==========================================
+
+# 当前协程/线程中专属的 FeishuReporter
+_reporter_ctx: ContextVar[FeishuReporter | None] = ContextVar(
+    "feishu_reporter",
+    default=None,
+)
+
+# 允许每次收到消息时，根据 Session 动态创建引擎（挂专属 CostTracker 等）
+AgentEngineFactory = Callable[[Session], "AgentEngine"]
+
+
+def context_with_reporter(reporter: FeishuReporter) -> Token[FeishuReporter | None]:
+    """将专属 Reporter 写入当前 Context，返回 token 供 finally 复位。"""
+    return _reporter_ctx.set(reporter)
+
+
+def reporter_from_context() -> FeishuReporter | None:
+    """供底层 Middleware 提取专属 Reporter，发送审批卡片。"""
+    return _reporter_ctx.get()
+
+
+# ==========================================
+# 2. 飞书 Bot 核心调度器
+# ==========================================
+
 
 class FeishuBot:
     """封装飞书机器人配置与核心业务流。"""
 
     def __init__(
         self,
-        engine: AgentEngine,
-        session: Session | None = None,
+        factory: AgentEngineFactory,
         *,
         work_dir: str | None = None,
     ) -> None:
@@ -61,11 +90,8 @@ class FeishuBot:
 
         self.app_id = app_id
         self.app_secret = app_secret
-        self.engine = engine
-        # 可选绑定固定 Session；未绑定时按 chat_id 隔离
-        self.sess = session
-        # 最近一次 Agent 运行绑定的 Reporter，供 Middleware 审批通知复用
-        self._reporter: FeishuReporter | None = None
+        # 工厂：按 Session 创建挂好账单等装饰的引擎，避免多会话共用一个引擎
+        self.factory = factory
         # 会话工作区：默认 cwd/workspace，与 CLI 约定一致
         self.work_dir = work_dir or str(Path.cwd() / "workspace")
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
@@ -215,10 +241,6 @@ class FeishuBot:
             }
         )
 
-    def reporter(self) -> FeishuReporter | None:
-        """返回 FeishuBot 当前绑定的 Reporter（供审批 Middleware 发通知）。"""
-        return self._reporter
-
     def _spawn_agent_run(self, chat_id: str, prompt: str) -> None:
         """在独立线程中启动 Agent，避免占用飞书长连接的事件循环。"""
         threading.Thread(
@@ -228,19 +250,21 @@ class FeishuBot:
         ).start()
 
     async def _handle_agent_run(self, chat_id: str, prompt: str) -> None:
-        """连接飞书与底层引擎的桥梁。"""
+        """连接飞书与底层引擎的桥梁（每请求独立 Reporter + 引擎，防串发）。"""
+        # 为当前并发请求实例化专属 Reporter
         reporter = FeishuReporter(client=self.client, chat_id=chat_id)
-        # 绑定本轮 Reporter，便于 Middleware 发起审批通知
-        self._reporter = reporter
-
-        # 优先使用构造时绑定的 Session；否则按 chat_id 隔离
-        session = self.sess or global_session_mgr.get_or_create(
-            chat_id,
-            self.work_dir,
-        )
-        session.append(Message(role=Role.USER, content=prompt))
+        # 【驾驭核心】写入 Context，供 Middleware 提取，避免多会话覆盖同一字段
+        token = context_with_reporter(reporter)
         try:
-            await self.engine.run(session, reporter)
+            # 1. 按 chat_id 物理隔离 Session
+            session = global_session_mgr.get_or_create(chat_id, self.work_dir)
+            session.append(Message(role=Role.USER, content=prompt))
+
+            # 2. 工厂为当前会话生成挂好专属 CostTracker 等的新引擎
+            eng = self.factory(session)
+
+            # 3. 启动 Main Loop（Reporter 同时显式传入引擎回传进度）
+            await eng.run(session, reporter)
         except Exception as err:
             logger.exception("[Feishu] Agent 运行崩溃 chat_id=%s", chat_id)
             try:
@@ -248,6 +272,13 @@ class FeishuBot:
             except Exception:
                 # 发消息本身也可能失败（如 21001 无法取 token），避免二次抛错淹没日志
                 logger.exception("[Feishu] 崩溃通知发送也失败 chat_id=%s", chat_id)
+        finally:
+            _reporter_ctx.reset(token)
+
+
+# ==========================================
+# 3. 飞书 Reporter 实现
+# ==========================================
 
 
 class FeishuReporter(Reporter):

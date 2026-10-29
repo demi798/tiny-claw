@@ -94,7 +94,7 @@ async def _async_main(prompt: str, work_dir: str, session_id: str) -> None:
     # CLI 默认 YOLO：全权信任本地执行，暂不挂载飞书审批 Middleware
 
     # 4. 核心引擎（内部自动装配 Composer / Compactor / Recovery / Reminder）
-    # enable_thinking=False，plan_mode=True（与 Go NewAgentEngine(..., false, true) 对齐）
+    # enable_thinking=False，plan_mode=True
     engine = AgentEngine(
         tracked_provider,
         registry,

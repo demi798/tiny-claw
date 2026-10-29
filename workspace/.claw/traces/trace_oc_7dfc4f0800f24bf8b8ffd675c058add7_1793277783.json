@@ -1,0 +1,29 @@
+{
+  "name": "Agent.Run",
+  "start_time": "2026-10-29T20:43:00.617",
+  "end_time": "2026-10-29T20:43:03.803",
+  "duration_ms": 3185,
+  "attributes": {
+    "SessionID": "oc_7dfc4f0800f24bf8b8ffd675c058add7",
+    "WorkDir": "/Users/wu/Documents/code/ai-practice-homework/tiny-claw/workspace"
+  },
+  "children": [
+    {
+      "name": "Turn-1",
+      "start_time": "2026-10-29T20:43:00.620",
+      "end_time": "2026-10-29T20:43:03.803",
+      "duration_ms": 3182,
+      "attributes": {
+        "context_message_count": 2
+      },
+      "children": [
+        {
+          "name": "LLM.Action",
+          "start_time": "2026-10-29T20:43:00.620",
+          "end_time": "2026-10-29T20:43:02.944",
+          "duration_ms": 2323
+        }
+      ]
+    }
+  ]
+}

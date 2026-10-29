@@ -302,25 +302,30 @@ def demo_feishu_approval() -> None:
     """飞书 WS + Middleware 审批卡片。阻塞主线程，勿与其它 asyncio 演示同开。"""
     import lark_oapi as lark
     from internal.feishu.approval import global_approval_mgr, is_dangerous_command
-    from internal.feishu.bot import FeishuBot
+    from internal.feishu.bot import FeishuBot, reporter_from_context
 
     _require_api_key()
     work_dir = _workspace_dir()
     registry = new_registry()
     _register_basic_tools(registry, work_dir)
-    engine = _new_engine(_new_provider(), registry, approval_gate=True)
-    session = global_session_mgr.get_or_create("test_command_intercept_001", work_dir)
-    session.clear()
-    bot = FeishuBot(engine, session, work_dir=work_dir)
+    base_provider = _new_provider()
+
+    # 工厂：按 Session 挂专属 CostTracker，避免多会话账单/引擎串台
+    def _factory(session: Session) -> AgentEngine:
+        tracked = CostTracker(base_provider, _MODEL, session)
+        return _new_engine(tracked, registry, approval_gate=True)
+
+    bot = FeishuBot(_factory, work_dir=work_dir)
 
     def _approval_middleware(call: ToolCall) -> tuple[bool, str]:
         args_str = _args_to_str(call.arguments)
         if is_dangerous_command(call.name, args_str):
+            # 从 Context 取本请求专属 Reporter，避免并发覆盖
             allowed, reason = global_approval_mgr.wait_for_approval(
                 call.id,
                 call.name,
                 args_str,
-                bot.reporter(),
+                reporter_from_context(),
             )
             return (True, "") if allowed else (False, reason)
         return True, ""

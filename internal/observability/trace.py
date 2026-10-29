@@ -1,4 +1,4 @@
-"""轻量链路追踪：用 contextvars 模拟 Go context.Context 挂载 Span。"""
+"""轻量链路追踪：用 contextvars 挂载 Span。"""
 
 from __future__ import annotations
 

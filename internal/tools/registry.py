@@ -167,7 +167,7 @@ def _truncate(s: str, max_len: int) -> str:
 
 
 def _arguments_to_str(arguments: Any) -> str:
-    """将工具参数规范为调试用字符串（对应 Go 的 string(call.Arguments)）。"""
+    """将工具参数规范为调试用字符串。"""
     if isinstance(arguments, (bytes, bytearray)):
         return bytes(arguments).decode("utf-8", errors="replace")
     if isinstance(arguments, str):

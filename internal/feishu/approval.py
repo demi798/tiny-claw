@@ -197,23 +197,33 @@ def build_approval_card(
 
 
 def is_dangerous_command(tool_name: str, args: str) -> bool:
-    """简单正则黑名单：判断该工具调用是否需要审批。"""
-    # 纯读取类工具：YOLO 模式，全部放行
-    if tool_name not in {"bash", "write_file", "edit_file"}:
+    """简单正则黑名单：判断该工具调用是否需要触发人类审批。"""
+    # 白名单放行：纯读取工具默认 YOLO，全部放行
+    if tool_name == "read_file":
         return False
+
+    # 【剧本设定】生产服务器 AgentOps：修改任何文件都是高危操作
+    # 不允许 Agent 擅自 write_file 覆写，或 edit_file 篡改代码
+    if tool_name in {"write_file", "edit_file"}:
+        return True
 
     # 针对 bash 的高危模式匹配
     if tool_name == "bash":
+        # 危险指令特征库（模拟真实运维黑名单）
         dangerous_patterns = [
             r"rm\s+-r",  # 级联删除
-            r"sudo\s+",  # 提权
-            r"drop\s+",  # 数据库删除
+            r"sudo\s+",  # 提权操作
+            r"drop\s+",  # 数据库危险命令
             r">.*\.py",  # 恶意覆盖源代码
+            r"nginx\s+-s",  # 拦截 Nginx 服务重启或停止
+            r"systemctl\s+",  # 拦截系统级服务管理
+            r"kill\s+",  # 拦截杀进程操作
         ]
         for pattern in dangerous_patterns:
             if re.search(pattern, args):
-                return True
+                return True  # 命中任一黑名单，必须挂起审批
 
+    # 未命中高危特征则默认放行（如 ls -la、tail -n 50 等探测命令）
     return False
 
 

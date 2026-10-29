@@ -1,6 +1,5 @@
-"""评测基准：定义用例，并在隔离沙箱中跑 Agent 验收。
-
-对应 Go ``internal/eval/benchmark.go`` 的 TestCase / TestResult / BenchmarkRunner。
+"""
+评测基准：定义用例，并在隔离沙箱中跑 Agent 验收。
 """
 
 from __future__ import annotations
@@ -187,7 +186,7 @@ class BenchmarkRunner:
 
 
 def new_benchmark_runner(model: str) -> BenchmarkRunner:
-    """构造 BenchmarkRunner（对应 Go NewBenchmarkRunner）。"""
+    """构造 BenchmarkRunner。"""
     return BenchmarkRunner(model)
 
 
