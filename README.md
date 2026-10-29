@@ -15,11 +15,11 @@
 | Working Memory | 按**完整回合**裁剪（默认约 **20** 条）；保证窗口以 User 开头，防智谱 `1214` | ✅ |
 | Compactor 压缩 | 超水位线后：远期掩码 + 近期头尾截断；只改发给模型的临时上下文 | ✅ |
 | Recovery 自愈 | 工具失败时按报错特征注入「系统救援指南」 | ✅ |
-| Reminder 死循环打断 | 同指纹连续**失败**或连续**成功** ≥3 次，注入 `Role.USER` 强力 Reminder | ✅ |
+| Reminder 死循环打断 | 同指纹连续**失败** ≥3 或连续**成功** ≥8 次，注入 `Role.USER` 强力 Reminder | ✅ |
 | CostTracker 账单 | Provider 装饰器提取 Usage，累加 Session Token / 费用 | ✅ |
 | Tracing 链路追踪 | `contextvars` 挂载 Span；`Agent.Run` → `Turn-N` → `LLM.*` / `Tool.Execute`；导出 JSON | ✅ |
 | Harness Benchmark | 隔离沙箱 + Setup/Task/Validate；`CostTracker` 记账；汇总通过率与成本 | ✅ |
-| Plan Mode | 进度外部化到 `PLAN.md` / `TODO.md`，支持断点续传 | ✅ |
+| Plan Mode | 进度外部化到 `PLAN.md` / `TODO.md`（支持 `PLAN{N}` / `TODO{N}` 编号对）；未完成则并存新编号，已完成则删旧覆盖 | ✅ |
 | Approval Gate | System Prompt 要求原样调工具，安全交给 Middleware + 人类 | ✅ |
 | Registry Middleware | `registry.use(mw)`：执行前拦截；可挂人工审批 | ✅ |
 | 飞书人工审批 | 高危命令发交互卡片（通过/拒绝）；`card.action.trigger` + 文本口令兜底 | ✅ |
@@ -73,14 +73,14 @@
 - **Working Memory**：按「完整回合」从尾部裁剪（非裸条数乱切）；窗口须以普通 User 开头，否则补紧邻 User 或插入合成 User。
 - **Compactor**：只压缩「本轮发给模型」的临时列表；Session 仍是全量原文。
 - **Recovery**：工具 `IsError` 时增强 stderr，引导改主意。
-- **Reminder**：同指纹连续失败 **或** 连续成功 ≥3 次，追加 User 级打断消息。
+- **Reminder**：同指纹连续失败 ≥3 **或** 连续成功 ≥8 次，追加 User 级打断消息。
 - **CostTracker**：装饰 LLMProvider，按模型单价把 Usage 写入 Session。
 - **Tracing**：用 `contextvars` 模拟 Go `context.Context` 挂载 Span；父子自动绑定；结束导出 JSON。
 - **Benchmark**：每用例独立 `workspace/{id}_{ts}/` 沙箱；Setup → Agent → Validate（exit 0 算过）；账单记在独立 Session。
 - **Middleware**：工具真正执行前可拦截；高危命令可挂起等待人类审批。
 - **Approval Gate**：提示模型勿口头拒答，安全由中间件 + 人类把关。
 - **Subagent**：主 Agent 通过 `spawn_subagent` 委派；子循环不写主 Session，只回摘要。
-- **Plan Mode**：强制维护 `PLAN.md` / `TODO.md`。
+- **Plan Mode**：强制维护「当前活跃」`PLAN`/`TODO` 文件对（默认同名；多任务并存时用 `PLAN1.md`/`TODO1.md` 等编号对）。
 - **调用约定**：先 `session.append(用户输入)`，再 `engine.run(session, reporter)`。
 - **工具边界**：只能访问 `session.work_dir`（默认 `./workspace`）。
 
@@ -103,7 +103,7 @@ tiny-claw/
 │   ├── auth.py                   # Recovery 演示目标
 │   ├── config.txt                # Subagent 演示：待查找的「核心密码」（需自备）
 │   ├── answer.txt                # Subagent 演示：主 Agent 写入结果
-│   ├── PLAN.md / TODO.md
+│   ├── PLAN.md / TODO.md         # Plan Mode 默认对；亦可有 PLAN1.md / TODO1.md …
 │   ├── trace_test.md             # Tracing 演示写入产物
 │   ├── .claw/traces/             # Trace JSON 导出目录
 │   ├── test_001_edit_*/          # Benchmark 隔离沙箱（按用例生成）
@@ -117,11 +117,11 @@ tiny-claw/
 │   ├── engine/
 │   │   ├── loop.py               # run + run_sub；Compactor / Recovery / Reminder / Tracing
 │   │   ├── session.py            # WM 回合裁剪 + record_usage
-│   │   ├── reminder.py           # 失败/成功死循环打断
+│   │   ├── reminder.py           # 失败/成功死循环打断（成功打断提及编号 PLAN/TODO）
 │   │   ├── reporter.py
 │   │   └── terminal_reporter.py
 │   ├── context/
-│   │   ├── composer.py           # Plan Mode + Approval Gate
+│   │   ├── composer.py           # Plan Mode（含编号对分支）+ Approval Gate
 │   │   ├── skill.py
 │   │   ├── compactor.py
 │   │   └── recovery.py
@@ -220,7 +220,7 @@ python cmd/claw/main.py -p "在 workspace 里搭一个简单的静态页服务"
 | --- | --- |
 | Session | `task_web_server_001` |
 | 引擎 | `plan_mode=True` |
-| 外部化 | `PLAN.md` / `TODO.md` 断点续传 |
+| 外部化 | 默认 `PLAN.md` / `TODO.md`；旧任务未完成且开新任务 → `PLAN{N}.md` / `TODO{N}.md`；旧任务全勾完 → 删旧覆盖 |
 
 ### 4. Recovery 自愈演示
 
@@ -371,11 +371,12 @@ python cmd/bench/main.py
 
 | 结果 | 计数行为 | 打断条件 |
 | --- | --- | --- |
-| 成功 | 清空失败计数；同指纹成功次数 +1（换指纹则从 1 重计） | 连续成功 **≥3** → 注入「停止无意义重复 / 推进或收尾」 |
+| 成功 | 清空失败计数；同指纹成功次数 +1（换指纹则从 1 重计） | 连续成功 **≥8** → 注入「停止无意义重复 / 推进或收尾」 |
 | 失败 | 清空成功计数；同指纹失败次数 +1 | 连续失败 **≥3** → 注入「改策略或向人求助」（原逻辑） |
 
 - 指纹：`md5(tool_name + args)`
 - 引擎在 Observation 写入 Session 后调用；简化策略取本轮**第一个**工具结果分析
+- 成功打断文案要求推进「当前活跃」的 PLAN/TODO 文件对（含编号形式如 `PLAN1.md` / `TODO1.md`）
 
 > 仅防「失败死循环」时，同参反复成功（如反复 `curl` 同一 URL）不会触发；现已覆盖。
 
@@ -450,11 +451,16 @@ Agent.Run
 
 ## Plan Mode 行为摘要
 
-`PromptComposer(..., plan_mode=True)`：
+`PromptComposer(..., plan_mode=True)`（`_PLAN_MODE_PROMPT`）：
 
-1. Bootstrapping：嗅探 / 创建或续读 `PLAN.md`、`TODO.md`
-2. 单步打勾：完成一步立即 `- [x]`
-3. 迷失时重读 `TODO.md`
+文件约定：默认对为 `PLAN.md` / `TODO.md`；并存多任务时用同号配对的 `PLAN{N}.md` / `TODO{N}.md`（N 从 1 递增）。「当前活跃对」指本轮实际读写的那一对。
+
+1. **Bootstrapping**（`ls PLAN*.md TODO*.md`，并检查 TODO 是否仍有 `- [ ]`）
+   - **分支 A（全新）**：无任何 `PLAN*`/`TODO*` → 创建默认 `PLAN.md` / `TODO.md`
+   - **分支 B（未完成）**：TODO 仍有 `- [ ]` → 继续旧任务则不覆盖；若用户意图是新任务则新建下一编号对（仅有默认对时下一对为 `PLAN1.md`/`TODO1.md`）
+   - **分支 C（已完成）**：TODO 全为 `- [x]` → 删除该已完成对后同名覆盖重写
+2. **单步打勾**：只改「当前活跃对」的 TODO；完成一步立即 `- [x]`；禁止误改其他编号文件
+3. **迷失自救**：重读「当前活跃对」的 TODO
 
 ---
 
@@ -500,7 +506,7 @@ engine.run（主线）
 | Turn 2「不记得密钥」 | Working Memory 截断（Session 隔离演示预期） |
 | `[Compactor] 内存告警` | 超水位线（预期） |
 | `注入救援指南` | Recovery 触发（Recovery 演示预期） |
-| Reminder 死循环干预 | 同指纹失败或成功 ≥3（日志含「成功死循环干预」） |
+| Reminder 死循环干预 | 同指纹失败 ≥3 或成功 ≥8（日志含「成功死循环干预」） |
 | `.claw/traces` 无文件 | 未跑完 `engine.run`（未进 finally）；或 `work_dir` 不对 |
 | Trace 里 Turn 互相嵌套 | 旧版未每轮 `end_span`；现已 `try/finally` 按轮结束 |
 | Benchmark「靶机 Setup 失败」 | `setup_script` 在沙箱 cwd 执行失败；检查 bash / 引号 |
@@ -583,6 +589,7 @@ engine.run（主线）
 
 | 日期 | 版本 / 标签 | 摘要 |
 | --- | --- | --- |
+| 2026-10-29 | — | Plan Mode：未完成新开 `PLAN{N}`/`TODO{N}`；已完成删旧覆盖；Reminder 成功打断支持编号文件对 |
 | 2026-10-29 | — | Harness Benchmark：`eval/benchmark.py` + `cmd/bench/main.py`；隔离沙箱 Setup/Validate；Python 用例 |
 | 2026-10-29 | — | Tracing：`trace.py` + loop/registry 埋点；导出 `.claw/traces`；`demo_trace` |
 | 2026-10-29 | — | WM 按回合裁剪 + User 首条防 1214；Reminder 覆盖「成功死循环」；CostTracker / Usage；演示入口合并为 `main.py` |
@@ -598,6 +605,11 @@ engine.run（主线）
 ### 迭代备注（自由文本）
 
 ```text
+# 2026-10-29（Plan Mode 编号对 / Reminder）
+# - composer._PLAN_MODE_PROMPT：分支 A 新建 / B 未完成续传或新开编号对 / C 已完成删旧覆盖
+# - 引入「当前活跃对」；支持 PLAN1.md/TODO1.md …
+# - reminder 成功死循环文案改为更新当前活跃 PLAN/TODO（含编号）
+
 # 2026-10-29（Harness Benchmark）
 # - eval/benchmark.py：TestCase / TestResult / BenchmarkRunner
 # - 隔离沙箱 + Setup → Agent(+CostTracker) → Validate；汇总通过率/成本
@@ -612,7 +624,7 @@ engine.run（主线）
 # 2026-10-29（WM / Reminder 成功循环 / 账单 / 统一入口）
 # - session.get_working_memory：按完整回合裁剪；紧邻 User / 合成 User
 # - openai：sanitize 后 system 后非 user 则插占位 user
-# - reminder：同指纹连续成功 ≥3 亦注入打断（保留失败 ≥3）
+# - reminder：同指纹连续成功 ≥8 亦注入打断（保留失败 ≥3）
 # - Usage + Session.record_usage；CostTracker 装饰 Provider
 # - cmd/claw/main.py：合并原 main～main6 为 demo_*，注释互斥切换
 
@@ -646,9 +658,9 @@ engine.run（主线）
 - [ ] Session 历史 JSONL 落盘
 - [ ] Compactor / WM 阈值可配置或按 token 预算
 - [x] Recovery：工具失败特征救援
-- [x] Plan Mode：`PLAN.md` / `TODO.md`
+- [x] Plan Mode：`PLAN.md` / `TODO.md`（含编号对并存与已完成覆盖）
 - [x] Reminder：连续失败死循环打断
-- [x] Reminder：连续成功死循环打断
+- [x] Reminder：连续成功死循环打断（文案支持编号 PLAN/TODO）
 - [x] WM 回合裁剪 + User 首条（防 1214）
 - [x] CostTracker / Usage 账单
 - [x] Tracing：contextvars Span + JSON 导出
