@@ -97,7 +97,7 @@ class PromptComposer:
             parts.append(_PLAN_MODE_PROMPT)
 
         # 外部化状态：加载项目专属规范 (AGENTS.md)
-        agents_md_path = self._work_dir / "AGENTS.md"
+        agents_md_path = self._work_dir / ".claw" / "AGENTS.md"
         try:
             agents_content = agents_md_path.read_text(encoding="utf-8")
         except OSError:

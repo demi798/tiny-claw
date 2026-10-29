@@ -2,7 +2,7 @@
 
 微型编码 Agent（Python 实现），灵感来自 OpenClaw：在受限工作区内调用大模型 + 工具，完成读文件、改代码、执行命令等任务，并通过 **Reporter** 把过程输出到终端或飞书。
 
-> 本项目仍在持续迭代。下文「变更记录」「路线图」会随版本更新，欢迎在对应章节补充说明。
+> 下文「变更记录」「路线图」会随版本更新，欢迎在对应章节补充说明。
 
 ---
 
@@ -31,7 +31,6 @@
 | Provider 清洗 | 消息链 sanitize + system 后强制 User 首条，降低智谱 `1214` | ✅ |
 | Reporter | 统一输出契约；终端 / 飞书实现 | ✅ |
 | 统一演示入口 | `cmd/claw/main.py`：CLI / Session / Plan / Recovery / 飞书 / Subagent / 账单 / Tracing（注释互斥切换） | ✅ |
-| 长期 Memory | `internal/memory` 占位 | 🚧 |
 | 多渠道（钉钉 / WebUI 等） | 可基于 Reporter 扩展 | 📋 |
 
 ---
@@ -95,24 +94,12 @@ tiny-claw/
 │   │   └── main.py               # 统一演示入口（注释切换各 demo_*）
 │   └── bench/
 │       └── main.py               # Harness Benchmark 跑分入口
-├── AGENTS.md
-├── .claw/skills/
-│   └── git-workflow/SKILL.md
 ├── workspace/                    # 默认工作区（.gitignore）
-│   ├── mock_log.txt
-│   ├── auth.py                   # Recovery 演示目标
-│   ├── config.txt                # Subagent 演示：待查找的「核心密码」（需自备）
-│   ├── answer.txt                # Subagent 演示：主 Agent 写入结果
-│   ├── PLAN.md / TODO.md         # Plan Mode 默认对；亦可有 PLAN1.md / TODO1.md …
-│   ├── trace_test.md             # Tracing 演示写入产物
-│   ├── .claw/traces/             # Trace JSON 导出目录
-│   ├── test_001_edit_*/          # Benchmark 隔离沙箱（按用例生成）
-│   ├── test_002_code_gen_*/
-│   └── …
-├── mock_log.txt
-├── tmp/
-│   ├── project_front/
-│   └── project_back/
+│   ├── .claw
+│   │   └── skills/
+│   │   │   └── git-workflow/SKILL.md
+│   │   ├── AGENTS.md
+│   └── ...
 ├── internal/
 │   ├── engine/
 │   │   ├── loop.py               # run + run_sub；Compactor / Recovery / Reminder / Tracing
@@ -137,9 +124,8 @@ tiny-claw/
 │   │   └── openai.py             # Usage 提取 + sanitize / User 首条
 │   ├── schema/                   # Message.usage / Usage
 │   ├── tools/
-│   │   ├── registry.py           # Middleware + Tool.Execute Span
-│   │   └── subagent.py           # spawn_subagent → AgentRunner.run_sub
-│   └── memory/
+│       ├── registry.py           # Middleware + Tool.Execute Span
+│       └── subagent.py           # spawn_subagent → AgentRunner.run_sub
 ├── .env
 └── README.md
 ```
