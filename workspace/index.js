@@ -1,11 +1,26 @@
+/**
+ * Node.js HTTP服务主入口文件
+ * 使用Express框架构建RESTful API服务
+ */
+
 const express = require('express');
 const app = express();
 const port = process.env.PORT || 3001;
 
-// 中间件
+// ==================== 中间件配置 ====================
+
+/**
+ * JSON解析中间件
+ * 自动解析请求体中的JSON数据
+ */
 app.use(express.json());
 
-// 根路径路由
+// ==================== 路由定义 ====================
+
+/**
+ * 根路径路由
+ * 返回服务基本信息
+ */
 app.get('/', (req, res) => {
   res.json({
     code: 200,
@@ -17,7 +32,10 @@ app.get('/', (req, res) => {
   });
 });
 
-// 健康检查接口
+/**
+ * 健康检查接口
+ * 用于监控服务状态和运行时间
+ */
 app.get('/health', (req, res) => {
   res.json({
     code: 200,
@@ -30,7 +48,12 @@ app.get('/health', (req, res) => {
   });
 });
 
-// 404错误处理
+// ==================== 错误处理 ====================
+
+/**
+ * 404错误处理中间件
+ * 处理未找到的路由请求
+ */
 app.use((req, res) => {
   res.status(404).json({
     code: 404,
@@ -39,9 +62,12 @@ app.use((req, res) => {
   });
 });
 
-// 全局错误处理中间件
+/**
+ * 全局错误处理中间件
+ * 捕获并处理所有未处理的错误
+ */
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
+  console.error('服务器错误:', err);
   res.status(500).json({
     code: 500,
     message: '服务器内部错误',
@@ -49,10 +75,15 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 启动服务器
+// ==================== 服务器启动 ====================
+
+/**
+ * 启动HTTP服务器
+ */
 app.listen(port, () => {
-  console.log(`服务器运行在 http://localhost:${port}`);
+  console.log(`🚀 服务器启动成功: http://localhost:${port}`);
   console.log('按 Ctrl+C 停止服务');
 });
 
+// 导出应用实例，支持模块化使用
 module.exports = app;
