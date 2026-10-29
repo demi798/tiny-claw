@@ -32,6 +32,7 @@
 | Reporter | 统一输出契约；终端 / 飞书实现 | ✅ |
 | CLI 入口 | `cmd/claw/main.py`：`-p` 任务 + 可选 `-d`/`-s`；默认 `plan_mode` + CostTracker + Tracing | ✅ |
 | 场景演示入口 | `cmd/claw/main_case.py`：各 `demo_*` 注释互斥（Session / Recovery / 飞书 / Subagent 等） | ✅ |
+| AgentOps 飞书运维 | `cmd/agentops/main.py`：长连接 + 高危 Middleware + 按 Session 工厂组装引擎 / CostTracker | ✅ |
 | 多渠道（钉钉 / WebUI 等） | 可基于 Reporter 扩展 | 📋 |
 
 ---
@@ -78,6 +79,7 @@
 - **Tracing**：用 `contextvars` 挂载 Span；父子自动绑定；结束导出 JSON。
 - **Benchmark**：每用例独立 `workspace/{id}_{ts}/` 沙箱；Setup → Agent → Validate（exit 0 算过）；账单记在独立 Session。
 - **Middleware**：工具真正执行前可拦截；高危命令可挂起等待人类审批。
+- **飞书并发**：`FeishuBot` 用工厂按 Session 建引擎；`contextvars` 传递专属 `FeishuReporter`，避免多群聊串发。
 - **Approval Gate**：提示模型勿口头拒答，安全由中间件 + 人类把关。
 - **Subagent**：主 Agent 通过 `spawn_subagent` 委派；子循环不写主 Session，只回摘要。
 - **Plan Mode**：强制维护「当前活跃」`PLAN`/`TODO` 文件对（默认同名；多任务并存时用 `PLAN1.md`/`TODO1.md` 等编号对）。
@@ -93,11 +95,13 @@ tiny-claw/
 ├── cmd/
 │   ├── claw/
 │   │   ├── main.py               # 正式 CLI：-p / -d / -s；Plan Mode + 账单 + Trace
-│   │   └── main_case.py           # 场景演示：注释互斥切换各 demo_*
+│   │   └── main_case.py          # 场景演示：注释互斥切换各 demo_*
+│   ├── agentops/
+│   │   └── main.py               # AgentOps：飞书长连接 + 审批 Middleware + 引擎工厂
 │   └── bench/
 │       └── main.py               # Harness Benchmark 跑分入口
 ├── workspace/                    # 默认工作区（.gitignore）
-│   ├── .claw
+│   ├── .claw/
 │   │   └── skills/
 │   │   │   └── git-workflow/SKILL.md
 │   │   ├── AGENTS.md
@@ -120,8 +124,8 @@ tiny-claw/
 │   │   ├── tracker.py            # CostTracker 账单装饰器
 │   │   └── trace.py              # Span + contextvars + 导出 JSON
 │   ├── feishu/
-│   │   ├── bot.py                # 长连接事件 + card.action.trigger
-│   │   └── approval.py           # ApprovalManager + 审批卡片 JSON
+│   │   ├── bot.py                # 工厂 + contextvars Reporter；长连接/卡片/口令
+│   │   └── approval.py           # ApprovalManager + is_dangerous_command + 卡片 JSON
 │   ├── provider/
 │   │   └── openai.py             # Usage 提取 + sanitize / User 首条
 │   ├── schema/                   # Message.usage / Usage
@@ -151,7 +155,7 @@ pip install openai python-dotenv lark-oapi flask
 # 大模型（智谱 OpenAI 兼容）
 ZHIPU_API_KEY=your_zhipu_api_key
 
-# 飞书（main_case.demo_feishu_approval / 飞书 Bot 需要）
+# 飞书（agentops / main_case.demo_feishu_approval 需要）
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_ENCRYPT_KEY=xxx          # 仅 HTTP 回调需要；长连接可空
@@ -162,7 +166,7 @@ FEISHU_VERIFY_TOKEN=xxx
 
 ## 快速启动
 
-正式 CLI 入口是 **`cmd/claw/main.py`**（需 `-p`）。专题场景（双 Session / Recovery / 飞书审批 / Subagent 等）见 **`cmd/claw/main_case.py`**，在其 `main()` 里一次只取消注释一个 `demo_*`。
+正式 CLI 入口是 **`cmd/claw/main.py`**（需 `-p`）。飞书运维用 **`cmd/agentops/main.py`**（长连接）。专题场景（双 Session / Recovery / 飞书演示 / Subagent 等）见 **`cmd/claw/main_case.py`**，在其 `main()` 里一次只取消注释一个 `demo_*`。
 
 让 `AGENTS.md` / Skills 生效时放到 **work_dir**（默认可用 `workspace/`）：
 
@@ -219,9 +223,27 @@ python cmd/claw/main_case.py
 
 飞书审批开放平台请确认：长连接 + `im.message.receive_v1`；卡片回传 `card.action.trigger`；改配置后发版。
 
-### 3. Harness Benchmark 跑分
+### 3. AgentOps 飞书运维（`cmd/agentops/main.py`）
 
-独立入口（与 `main.py` / `main_case.py` 无关）：
+生产向运维入口：WebSocket 长连接 + 高危审批 Middleware + 按 Session 工厂组装引擎。
+
+```bash
+cd tiny-claw
+python cmd/agentops/main.py
+```
+
+| 项 | 说明 |
+| --- | --- |
+| 模型 | `glm-4.6v`（`_MODEL`） |
+| 工作区 | `./workspace` |
+| 连接 | `lark.ws.Client` 长连接（`use_long_connection=True`，无需 ngrok） |
+| 引擎 | 工厂按 Session 挂 `CostTracker`；`enable_thinking=False`，`plan_mode=False` |
+| Middleware | `is_dangerous_command` 命中 → `reporter_from_context()` + `wait_for_approval` |
+| 黑名单摘要 | `read_file` 放行；`write_file`/`edit_file` 一律审批；`bash` 匹配 `rm -r` / `sudo` / `drop` / `>*.py` / `nginx -s` / `systemctl` / `kill` 等 |
+
+### 4. Harness Benchmark 跑分
+
+独立入口（与 `main.py` / `main_case.py` / `agentops` 无关）：
 
 ```bash
 python cmd/bench/main.py
@@ -358,9 +380,12 @@ Agent.Run
 
 1. `wait_for_approval`：登记 TaskID 队列 → 发交互卡片（独立线程发送，避免堵死事件循环）→ `Queue.get()` 阻塞
 2. `resolve_approval`：卡片按钮或文本口令唤醒
-3. `is_dangerous_command`：对 `bash` 匹配 `rm -r` / `sudo` / `drop` / 重定向覆盖 `.py` 等
+3. `is_dangerous_command`：
+   - `read_file`：白名单放行
+   - `write_file` / `edit_file`：一律视为高危（AgentOps 剧本）
+   - `bash`：匹配 `rm -r` / `sudo` / `drop` / `>.*\.py` / `nginx -s` / `systemctl` / `kill` 等
 
-`approval_gate=True` 时 System Prompt 要求模型**原样调工具**，勿口头拒答（否则中间件进不去）。
+`approval_gate=True` 时 System Prompt 要求模型**原样调工具**，勿口头拒答（否则中间件进不去）。AgentOps 入口靠 Middleware 拦截，默认未开 `approval_gate`。
 
 ---
 
@@ -403,8 +428,12 @@ engine.run（主线）
 
 ## 飞书模式
 
-- 在 `main_case.py` 启用 `demo_feishu_approval()`：WebSocket 长连接 + 审批卡片
-- `FeishuBot`：可绑定固定 Session；处理文本审批口令与 `card.action.trigger`
+- **推荐入口**：`python cmd/agentops/main.py`（长连接 + Middleware + 引擎工厂）
+- 演示入口：`main_case.py` 启用 `demo_feishu_approval()`（同样长连接 + 审批卡片）
+- `FeishuBot(factory, work_dir=...)`：
+  - 按 `chat_id` 隔离 Session；`factory(session)` 为每会话挂专属 `CostTracker` 引擎
+  - `context_with_reporter` / `reporter_from_context`（`contextvars`）避免多会话 Reporter 串发
+  - 处理文本口令 `approve`/`reject` 与 `card.action.trigger`
 
 ### 常见问题
 
@@ -479,9 +508,13 @@ engine.run（主线）
 - 注入 `AgentRunner`（通常即主引擎）+ 只读 Registry + 可选 Reporter
 - 见上文「Subagent 行为摘要」
 
-### ApprovalManager（`internal/feishu/approval.py`）
+### FeishuBot / ApprovalManager
 
-见上文「Middleware / 人工审批摘要」。`build_approval_card` 生成通过/拒绝按钮卡片。
+| 组件 | 作用 |
+| --- | --- |
+| `FeishuBot` | 工厂建引擎；Context 传 Reporter；长连接事件 + 口令/卡片审批 |
+| `ApprovalManager` | 见上文「Middleware / 人工审批摘要」；`build_approval_card` 生成通过/拒绝按钮卡片 |
+| `cmd/agentops/main.py` | AgentOps 正式飞书运维入口 |
 
 ### PromptComposer / SkillLoader
 
@@ -504,6 +537,7 @@ engine.run（主线）
 
 | 日期 | 版本 / 标签 | 摘要 |
 | --- | --- | --- |
+| 2026-10-29 | — | AgentOps：`cmd/agentops/main.py` 飞书长连接；`FeishuBot` 工厂 + contextvars Reporter；`is_dangerous_command` 收紧（写文件一律审批 + nginx/systemctl/kill） |
 | 2026-10-29 | — | Plan Mode：未完成新开 `PLAN{N}`/`TODO{N}`；已完成删旧覆盖；Reminder 成功打断支持编号文件对 |
 | 2026-10-29 | — | Harness Benchmark：`eval/benchmark.py` + `cmd/bench/main.py`；隔离沙箱 Setup/Validate；Python 用例 |
 | 2026-10-29 | — | Tracing：`trace.py` + loop/registry 埋点；导出 `.claw/traces`；`demo_trace` |
@@ -520,6 +554,11 @@ engine.run（主线）
 ### 迭代备注（自由文本）
 
 ```text
+# 2026-10-29（AgentOps / 飞书防串发 / 审批黑名单）
+# - cmd/agentops/main.py：长连接 + Middleware + engine factory + CostTracker
+# - bot.py：AgentEngineFactory；context_with_reporter / reporter_from_context
+# - approval.is_dangerous_command：write/edit 一律审批；bash 增 nginx/systemctl/kill
+
 # 2026-10-29（Plan Mode 编号对 / Reminder）
 # - composer._PLAN_MODE_PROMPT：分支 A 新建 / B 未完成续传或新开编号对 / C 已完成删旧覆盖
 # - 引入「当前活跃对」；支持 PLAN1.md/TODO1.md …
@@ -569,7 +608,7 @@ engine.run（主线）
 ## 路线图
 
 - [ ] `requirements.txt` / `pyproject.toml`
-- [ ] 飞书 / 专题演示并入 CLI 启动参数（当前：`main.py` 管通用任务，`main_case.py` 靠注释互斥）
+- [ ] 专题演示并入 CLI 启动参数（当前：`main.py` 通用任务，`agentops` 飞书运维，`main_case.py` 注释互斥）
 - [ ] Session 历史 JSONL 落盘
 - [ ] Compactor / WM 阈值可配置或按 token 预算
 - [x] Recovery：工具失败特征救援
@@ -581,6 +620,8 @@ engine.run（主线）
 - [x] Tracing：contextvars Span + JSON 导出
 - [x] Harness Benchmark：隔离沙箱 + Setup/Validate 跑分
 - [x] Middleware + 飞书人工审批卡片
+- [x] AgentOps 飞书运维入口（长连接 + 工厂引擎）
+- [x] FeishuBot 防串发（工厂 + contextvars Reporter）
 - [x] Subagent：只读探路者 + 摘要回流
 - [ ] Benchmark `max_turns` 接入引擎限轮
 - [ ] `internal/memory` 跨会话长期记忆
