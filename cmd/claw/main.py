@@ -402,23 +402,58 @@ async def demo_observability() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 阶段 8 — Tracing 链路追踪
+# ---------------------------------------------------------------------------
+
+async def demo_trace() -> None:
+    """触发跨工具任务，验证 Span 树写入 workspace/.claw/traces。"""
+    _require_api_key()
+    work_dir = _workspace_dir()
+
+    registry = new_registry()
+    # 仅挂 bash + write_file
+    registry.register(BashTool(work_dir))
+    registry.register(WriteFileTool(work_dir))
+
+    engine = _new_engine(_new_provider(), registry)
+    reporter = TerminalReporter()
+    session = global_session_mgr.get_or_create("test_trace_001", work_dir)
+
+    # 触发跨工具类型任务（引擎对含 bash/写操作会串行；Trace 仍会挂多个 Tool.Execute）
+    prompt = dedent(
+        """
+        为了加快执行速度，请你在一轮回复中，【同时并行】完成以下两件事：
+        1. 使用 bash 工具执行 'sleep 2 && echo "系统环境检查完毕"'
+        2. 使用 write_file 工具，在当前目录下创建一个 'trace_test.md'，内容写上 "测试并发的写入"。
+        请确保你是分别调用两个不同的工具，不要试图把它们合并成一个命令！
+        """
+    ).strip()
+
+    logger.info("\n>>> 🚀 启动带 Tracing 链路追踪的测试...")
+    await _run_once(engine, session, prompt, reporter)
+    logger.info(
+        "📊 Trace 已导出，请查看: %s/.claw/traces/",
+        work_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 入口：一次只启用一个演示（互斥处用注释）
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     try:
         # --- 互斥：一次只打开一个 ---
-        # asyncio.run(demo_cli())                # main.py   CLI / Reminder
-        # asyncio.run(demo_session_isolation())  # main1.py  双会话 WM
+        # asyncio.run(demo_cli())                # CLI / Reminder
+        # asyncio.run(demo_session_isolation())  # 双会话 WM
+        # args = _parse_plan_args()
+        # asyncio.run(demo_plan_mode(args.prompt))  # Plan Mode：python main.py -p "..."
+        # asyncio.run(demo_recovery())           # Recovery
+        # demo_feishu_approval()                 # 飞书阻塞（勿包 asyncio.run）
+        # asyncio.run(demo_subagent())           # Subagent
+        # asyncio.run(demo_observability())      # 账单仪表盘
 
-        # Plan Mode（执行：python main.py -p "任务描述"）
-        args = _parse_plan_args()
-        asyncio.run(demo_plan_mode(args.prompt))
-
-        # asyncio.run(demo_recovery())           # main3.py  Recovery
-        # demo_feishu_approval()                 # main4.py  飞书阻塞（勿包 asyncio.run）
-        # asyncio.run(demo_subagent())           # main5.py  Subagent
-        # asyncio.run(demo_observability())      # main6.py  账单仪表盘
+        asyncio.run(demo_trace())                # Tracing 链路追踪
     except Exception:
         logger.exception("引擎运行崩溃")
         raise SystemExit(1) from None

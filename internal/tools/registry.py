@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
 
+from internal.observability.trace import start_span
 from internal.schema import ToolCall, ToolDefinition, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -93,52 +94,90 @@ class ToolRegistry(Registry):
         return [tool.definition() for tool in self._tools.values()]
 
     async def execute(self, call: ToolCall) -> ToolResult:
-        # 1. 路由查找：找不到说明模型产生了幻觉
-        tool = self._tools.get(call.name)
-        if tool is None:
-            return ToolResult(
-                tool_call_id=call.id,
-                output=f"Error: 系统中不存在名为 '{call.name}' 的工具。",
-                is_error=True,
-            )
+        # 【埋点 5】工具执行 Span（挂在当前 Turn / 调用栈下）
+        span = start_span("Tool.Execute")
+        span.add_attribute("tool_name", call.name)
+        span.add_attribute("arguments", _arguments_to_str(call.arguments))
 
-        # 2. 【核心防御】执行底层逻辑前，依次运行所有 Middleware
-        for mw in self._middlewares:
-            allowed, reason = mw(call)
-            if not allowed:
-                logger.warning(
-                    "[Registry] ⚠️ 工具 %s 被 Middleware 拦截: %s",
-                    call.name,
-                    reason,
-                )
+        try:
+            # 1. 路由查找：找不到说明模型产生了幻觉
+            tool = self._tools.get(call.name)
+            if tool is None:
+                msg = f"Error: 系统中不存在名为 '{call.name}' 的工具。"
+                span.add_attribute("error", msg)
                 return ToolResult(
                     tool_call_id=call.id,
-                    output=f"执行被系统拦截。原因: {reason}",
-                    # 必须返回 Error，强制大模型阅读拒绝理由
+                    output=msg,
                     is_error=True,
                 )
 
-        # 3. 所有 Middleware 放行后，将原始 JSON 字节交给具体工具
-        try:
-            output = await tool.execute(_to_args_bytes(call.arguments))
-        except Exception as err:
-            # 底层执行失败：封装后交还给主循环
+            # 2. 【核心防御】执行底层逻辑前，依次运行所有 Middleware
+            for mw in self._middlewares:
+                allowed, reason = mw(call)
+                if not allowed:
+                    span.add_attribute("intercepted", True)
+                    span.add_attribute("reject_reason", reason)
+                    logger.warning(
+                        "[Registry] ⚠️ 工具 %s 被 Middleware 拦截: %s",
+                        call.name,
+                        reason,
+                    )
+                    return ToolResult(
+                        tool_call_id=call.id,
+                        output=f"执行被系统拦截。原因: {reason}",
+                        # 必须返回 Error，强制大模型阅读拒绝理由
+                        is_error=True,
+                    )
+
+            # 3. 所有 Middleware 放行后，将原始 JSON 字节交给具体工具
+            try:
+                output = await tool.execute(_to_args_bytes(call.arguments))
+            except Exception as err:
+                span.add_attribute("error", str(err))
+                # 底层执行失败：封装后交还给主循环
+                return ToolResult(
+                    tool_call_id=call.id,
+                    output=f"Error executing {call.name}: {err}",
+                    is_error=True,
+                )
+
+            # 只截取输出前 100 字符，防止 Trace 文件过度膨胀
+            span.add_attribute("output_preview", _truncate(output, 100))
+
             return ToolResult(
                 tool_call_id=call.id,
-                output=f"Error executing {call.name}: {err}",
-                is_error=True,
+                output=output,
+                is_error=False,
             )
-
-        return ToolResult(
-            tool_call_id=call.id,
-            output=output,
-            is_error=False,
-        )
+        finally:
+            # 无论成功失败，确保结束 Span
+            span.end_span()
 
 
 def new_registry() -> Registry:
     """创建默认工具注册表。"""
     return ToolRegistry()
+
+
+def _truncate(s: str, max_len: int) -> str:
+    """截断字符串，超出部分以 ... 结尾。"""
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + "..."
+
+
+def _arguments_to_str(arguments: Any) -> str:
+    """将工具参数规范为调试用字符串（对应 Go 的 string(call.Arguments)）。"""
+    if isinstance(arguments, (bytes, bytearray)):
+        return bytes(arguments).decode("utf-8", errors="replace")
+    if isinstance(arguments, str):
+        return arguments
+    if arguments is None:
+        return ""
+    try:
+        return json.dumps(arguments, ensure_ascii=False)
+    except TypeError:
+        return str(arguments)
 
 
 def _to_args_bytes(arguments: Any) -> bytes:

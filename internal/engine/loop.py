@@ -16,6 +16,7 @@ from internal.engine.session import Session
 from internal.provider.interface import LLMProvider
 from internal.schema.message import Message, Role, ToolCall, ToolDefinition, ToolResult
 from internal.tools.registry import Registry
+from internal.observability.trace import export_trace_to_file, start_span
 
 logger = logging.getLogger(__name__)
 
@@ -91,57 +92,104 @@ class AgentEngine:
             self.approval_gate,
         )
 
-        composer = PromptComposer(
-            session.work_dir,
-            plan_mode=self.plan_mode,
-            approval_gate=self.approval_gate,
-        )
-        system_msg = composer.build()
+        # 【埋点 1】Root Span：整次任务生命周期；退出时导出 Trace
+        root_span = start_span("Agent.Run")
+        root_span.add_attribute("SessionID", session.id)
+        root_span.add_attribute("WorkDir", session.work_dir)
 
-        turn = 0
-        while True:
-            turn += 1
-            logger.info("Turn %d 开始 session=%s", turn, session.id)
-
-            tools = self._registry.get_available_tools()
-
-            working_memory = session.get_working_memory(_WORKING_MEMORY_LIMIT)
-            context_history: list[Message] = [system_msg, *working_memory]
-            compacted_context = self.compactor.compact(context_history)
-
-            # 本轮 Thinking 正文（不单独写入 Session）
-            current_turn_thinking = ""
-
-            # ================= Phase 1: Thinking =================
-            if self.enable_thinking:
-                current_turn_thinking = await self._run_thinking(
-                    compacted_context,
-                    reporter,
-                )
-
-            # ================= Phase 2: Action =================
-            action = await self._run_action(compacted_context, tools, reporter)
-
-            # 【1214 修复】Thinking + Action 合并为合法的单条 Assistant
-            merged_content = "\n".join(
-                part for part in (current_turn_thinking.strip(), action.content.strip()) if part
+        try:
+            composer = PromptComposer(
+                session.work_dir,
+                plan_mode=self.plan_mode,
+                approval_gate=self.approval_gate,
             )
-            final_assistant = Message(
-                role=Role.ASSISTANT,
-                content=merged_content,
-                tool_calls=list(action.tool_calls),
+            system_msg = composer.build()
+
+            turn = 0
+            while True:
+                turn += 1
+                logger.info("Turn %d 开始 session=%s", turn, session.id)
+
+                # 【埋点 2】单轮 Turn；finally 保证 break/异常也会结束
+                turn_span = start_span(f"Turn-{turn}")
+                try:
+                    tools = self._registry.get_available_tools()
+
+                    working_memory = session.get_working_memory(_WORKING_MEMORY_LIMIT)
+                    context_history: list[Message] = [system_msg, *working_memory]
+                    compacted_context = self.compactor.compact(context_history)
+
+                    # 发给模型的实际上下文大小，便于排查幻觉
+                    turn_span.add_attribute(
+                        "context_message_count",
+                        len(compacted_context),
+                    )
+
+                    # 本轮 Thinking 正文（不单独写入 Session）
+                    current_turn_thinking = ""
+
+                    # ================= Phase 1: Thinking =================
+                    if self.enable_thinking:
+                        # 【埋点 3】Thinking；start_span 已自动挂到当前 Turn
+                        thinking_span = start_span("LLM.Thinking")
+                        try:
+                            current_turn_thinking = await self._run_thinking(
+                                compacted_context,
+                                reporter,
+                            )
+                        finally:
+                            thinking_span.end_span()
+
+                    # ================= Phase 2: Action =================
+                    # 【埋点 4】Action
+                    action_span = start_span("LLM.Action")
+                    try:
+                        action = await self._run_action(
+                            compacted_context,
+                            tools,
+                            reporter,
+                        )
+                    finally:
+                        action_span.end_span()
+
+                    # 【1214 修复】Thinking + Action 合并为合法的单条 Assistant
+                    merged_content = "\n".join(
+                        part
+                        for part in (
+                            current_turn_thinking.strip(),
+                            action.content.strip(),
+                        )
+                        if part
+                    )
+                    final_assistant = Message(
+                        role=Role.ASSISTANT,
+                        content=merged_content,
+                        tool_calls=list(action.tool_calls),
+                    )
+                    session.append(final_assistant)
+
+                    if action.content and reporter is not None:
+                        await reporter.on_message(action.content)
+
+                    if not action.tool_calls:
+                        logger.info("模型未请求工具，本轮会话挂起")
+                        break
+
+                    # ================= 执行工具并注入自愈模板 =================
+                    # 工具 Span 在 _execute_one_tool 内创建，并行时平挂在本 Turn 下
+                    await self._run_observations(
+                        session,
+                        action.tool_calls,
+                        reporter,
+                    )
+                finally:
+                    turn_span.end_span()
+        finally:
+            root_span.end_span()
+            export_trace_to_file(root_span, session.work_dir, session.id)
+            logger.info(
+                "📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下"
             )
-            session.append(final_assistant)
-
-            if action.content and reporter is not None:
-                await reporter.on_message(action.content)
-
-            if not action.tool_calls:
-                logger.info("模型未请求工具，本轮会话挂起")
-                break
-
-            # ================= 执行工具并注入自愈模板 =================
-            await self._run_observations(session, action.tool_calls, reporter)
 
     async def run_sub(
         self,
@@ -338,6 +386,7 @@ class AgentEngine:
         if reporter is not None:
             await reporter.on_tool_call(display_name, args_text)
 
+        # 工具 Span 由 Registry.execute（Tool.Execute）统一埋点，挂在当前 Turn 下
         result = await active_registry.execute(call)
 
         # 【核心拦截与注入】错误结果交给 Recovery 增强后再进上下文
