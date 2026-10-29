@@ -193,7 +193,7 @@ class AgentEngine:
             if not action.tool_calls:
                 return action.content
 
-            # 执行只读工具（与 Go 一致：并发）；结果仅写入本地 contextHistory
+            # 执行只读工具，并发执行；结果仅写入本地 contextHistory
             observation_msgs = await self._execute_sub_tools(
                 action.tool_calls,
                 read_only_registry,
