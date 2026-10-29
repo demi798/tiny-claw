@@ -1,4 +1,4 @@
-"""运行时 Reminder：监控连续失败并打断模型局部执念。"""
+"""运行时 Reminder：监控连续失败/成功重复并打断模型局部执念。"""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from internal.schema.message import Message, Role, ToolCall, ToolResult
 
 logger = logging.getLogger(__name__)
 
-# 同一指纹连续失败达到该阈值时，注入强力打断
+# 同一指纹连续失败 / 连续成功达到该阈值时，注入强力打断
 _FAILURE_THRESHOLD = 3
+_SUCCESS_REPEAT_THRESHOLD = 8
 
 
 class ReminderInjector:
@@ -21,6 +22,8 @@ class ReminderInjector:
     def __init__(self) -> None:
         # 连续失败的工具调用指纹 → 次数（指纹 = ToolName + Arguments 的 Hash）
         self._consecutive_failures: dict[str, int] = {}
+        # 连续成功且参数完全相同的指纹 → 次数（防「成功死循环」）
+        self._consecutive_successes: dict[str, int] = {}
 
     def check_and_inject(
         self,
@@ -30,18 +33,53 @@ class ReminderInjector:
         """分析本轮执行结果，决定是否在 Context 尾部追加 Reminder。
 
         返回的 Message 作为最新用户输入，强制大模型优先阅读；无需打断时返回 None。
+        覆盖两类死循环：
+        1. 相同工具+参数连续失败；
+        2. 相同工具+参数连续成功却仍重复调用。
         """
         fingerprint = _generate_fingerprint(
             last_tool_call.name,
             last_tool_call.arguments,
         )
 
-        # 工具执行成功：该路径已走通，清空所有失败计数器
+        # ---------- 成功路径：清空失败计数，累加「同参成功」次数 ----------
         if not last_result.is_error:
             self._consecutive_failures = {}
+
+            # 只保留当前指纹的连续成功计数；换了工具/参数则重新从 1 计
+            prev = self._consecutive_successes.get(fingerprint, 0)
+            self._consecutive_successes = {fingerprint: prev + 1}
+            success_count = prev + 1
+
+            logger.info(
+                "[Reminder] 监控到工具 %s 执行成功，该参数特征连续成功次数: %d",
+                last_tool_call.name,
+                success_count,
+            )
+
+            if success_count >= _SUCCESS_REPEAT_THRESHOLD:
+                logger.warning(
+                    "[Reminder] ⚠️ 触发成功死循环干预！注入强力修正指令。"
+                )
+                nudge_msg = (
+                    f"[SYSTEM REMINDER 警告] \n"
+                    f"你似乎陷入了死循环。你刚刚连续 {success_count} 次使用"
+                    f"完全相同的参数调用了 '{last_tool_call.name}' 工具，"
+                    f"并且都已经成功返回了结果。\n"
+                    f"请立即停止这种无意义的重复调用！继续执行不会带来新信息。\n"
+                    f"你需要：\n"
+                    f"1. 停止重复同一个已成功的操作。\n"
+                    f"2. 根据已有结果推进下一步（更新 PLAN.md / TODO.md、"
+                    f"换一个检查点，或直接向用户汇报并结束任务）。\n"
+                    f"3. 若任务目标已达成，请输出最终结论并停止调用工具。"
+                )
+                return Message(role=Role.USER, content=nudge_msg)
+
             return None
 
-        # 执行失败：累加该特征的失败次数
+        # ---------- 失败路径：清空成功计数，累加失败次数（保留原逻辑） ----------
+        self._consecutive_successes = {}
+
         self._consecutive_failures[fingerprint] = (
             self._consecutive_failures.get(fingerprint, 0) + 1
         )

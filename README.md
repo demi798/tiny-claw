@@ -12,10 +12,11 @@
 | --- | --- | --- |
 | ReAct 主循环 | Thinking（可选）→ Action → Observation；Thinking/Action 合并写入 Session | ✅ |
 | Session 会话 | 多会话隔离；全量历史在 Session；引擎无状态；支持 `clear()` | ✅ |
-| Working Memory | 每轮从 Session 取最近 N 条（默认 **20**），含孤儿 ToolResult 防线 | ✅ |
+| Working Memory | 按**完整回合**裁剪（默认约 **20** 条）；保证窗口以 User 开头，防智谱 `1214` | ✅ |
 | Compactor 压缩 | 超水位线后：远期掩码 + 近期头尾截断；只改发给模型的临时上下文 | ✅ |
 | Recovery 自愈 | 工具失败时按报错特征注入「系统救援指南」 | ✅ |
-| Reminder 死循环打断 | 同一工具指纹连续失败 ≥3 次，注入 `Role.USER` 强力 Reminder | ✅ |
+| Reminder 死循环打断 | 同指纹连续**失败**或连续**成功** ≥3 次，注入 `Role.USER` 强力 Reminder | ✅ |
+| CostTracker 账单 | Provider 装饰器提取 Usage，累加 Session Token / 费用 | ✅ |
 | Plan Mode | 进度外部化到 `PLAN.md` / `TODO.md`，支持断点续传 | ✅ |
 | Approval Gate | System Prompt 要求原样调工具，安全交给 Middleware + 人类 | ✅ |
 | Registry Middleware | `registry.use(mw)`：执行前拦截；可挂人工审批 | ✅ |
@@ -25,14 +26,9 @@
 | 工具集 | `read_file` / `write_file` / `edit_file` / `bash` / `spawn_subagent` | ✅ |
 | Subagent 探路者 | 主 Agent 委派只读子循环；摘要回流，防污染主上下文 | ✅ |
 | 并发策略 | 只读工具可并行；含写操作或 bash 时整批串行 | ✅ |
-| Provider 清洗 | OpenAI 消息链 sanitize，降低智谱 `1214` | ✅ |
+| Provider 清洗 | 消息链 sanitize + system 后强制 User 首条，降低智谱 `1214` | ✅ |
 | Reporter | 统一输出契约；终端 / 飞书实现 | ✅ |
-| CLI / OOM 演示 | `main.py`：压缩 / 死循环干预等 | ✅ |
-| Session 隔离演示 | `main1.py`：记忆截断 + 双会话隔离 | ✅ |
-| Plan Mode 演示 | `main2.py`：`--prompt` 长程任务 | ✅ |
-| Recovery 演示 | `main3.py`：陷阱指令诱发 `edit_file` 纠偏 | ✅ |
-| 飞书审批演示 | `main4.py`：长连接 + Middleware 审批卡片 | ✅ |
-| Subagent 演示 | `main5.py`：委派探路者找密码 → 主 Agent 写 `answer.txt` | ✅ |
+| 统一演示入口 | `cmd/claw/main.py`：CLI / Session / Plan / Recovery / 飞书 / Subagent / 账单（注释互斥切换） | ✅ |
 | 长期 Memory | `internal/memory` 占位 | 🚧 |
 | 多渠道（钉钉 / WebUI 等） | 可基于 Reporter 扩展 | 📋 |
 
@@ -51,7 +47,7 @@
         │  Compactor + Recovery + Reminder；可选 approval_gate
         │
         ├─ PromptComposer(work_dir, plan_mode, approval_gate).build()
-        ├─ session.get_working_memory(20)
+        ├─ session.get_working_memory(20)   # 按完整回合裁剪；必要时合成 User
         ├─ compacted = Compactor.compact([System]+WM)
         ├─ Thinking / Action → 合并 Assistant 写入 Session
         ├─ Registry.Execute
@@ -59,20 +55,21 @@
         │     ├─ 工具执行（含 spawn_subagent → engine.run_sub 只读子循环）
         │     └─ IsError → RecoveryManager.analyze_and_inject
         ├─ session.append(Observation…)
-        └─ ReminderInjector.check_and_inject → 必要时再 append User Reminder
+        └─ ReminderInjector.check_and_inject → 失败/成功死循环时 append User Reminder
                 │
          TerminalReporter / FeishuReporter（文本 / 交互卡片）
                 │
-         Provider（sanitize）+ Tools Registry（bound to work_dir）
+         Provider（sanitize + User 首条）+ Tools Registry（bound to work_dir）
 ```
 
 核心约定：
 
-- **Session**：绑定 `work_dir` 与完整对话历史；`work_dir` 跟随会话。
-- **Working Memory**：每轮只把「System + 最近 N 条」取出；全量仍在 Session。
+- **Session**：绑定 `work_dir` 与完整对话历史；`work_dir` 跟随会话；可 `record_usage` 累加账单。
+- **Working Memory**：按「完整回合」从尾部裁剪（非裸条数乱切）；窗口须以普通 User 开头，否则补紧邻 User 或插入合成 User。
 - **Compactor**：只压缩「本轮发给模型」的临时列表；Session 仍是全量原文。
 - **Recovery**：工具 `IsError` 时增强 stderr，引导改主意。
-- **Reminder**：同一调用指纹连续失败 ≥3 次，追加 User 级打断消息。
+- **Reminder**：同指纹连续失败 **或** 连续成功 ≥3 次，追加 User 级打断消息。
+- **CostTracker**：装饰 LLMProvider，按模型单价把 Usage 写入 Session。
 - **Middleware**：工具真正执行前可拦截；高危命令可挂起等待人类审批。
 - **Approval Gate**：提示模型勿口头拒答，安全由中间件 + 人类把关。
 - **Subagent**：主 Agent 通过 `spawn_subagent` 委派；子循环不写主 Session，只回摘要。
@@ -87,12 +84,7 @@
 ```text
 tiny-claw/
 ├── cmd/claw/
-│   ├── main.py                   # CLI 演示（Compactor / Reminder 等）
-│   ├── main1.py                  # Session / Working Memory 隔离
-│   ├── main2.py                  # Plan Mode：--prompt
-│   ├── main3.py                  # Recovery：edit_file 自愈
-│   ├── main4.py                  # 飞书长连接 + 高危审批卡片
-│   └── main5.py                  # Subagent：委派探路者 + 主写 answer.txt
+│   └── main.py                   # 统一演示入口（注释切换各 demo_*）
 ├── AGENTS.md
 ├── .claw/skills/
 │   └── git-workflow/SKILL.md
@@ -110,8 +102,8 @@ tiny-claw/
 ├── internal/
 │   ├── engine/
 │   │   ├── loop.py               # run + run_sub；Compactor / Recovery / Reminder
-│   │   ├── session.py
-│   │   ├── reminder.py           # 死循环打断
+│   │   ├── session.py            # WM 回合裁剪 + record_usage
+│   │   ├── reminder.py           # 失败/成功死循环打断
 │   │   ├── reporter.py
 │   │   └── terminal_reporter.py
 │   ├── context/
@@ -119,12 +111,14 @@ tiny-claw/
 │   │   ├── skill.py
 │   │   ├── compactor.py
 │   │   └── recovery.py
+│   ├── observability/
+│   │   └── tracker.py            # CostTracker 账单装饰器
 │   ├── feishu/
 │   │   ├── bot.py                # 长连接事件 + card.action.trigger
 │   │   └── approval.py           # ApprovalManager + 审批卡片 JSON
 │   ├── provider/
-│   │   └── openai.py
-│   ├── schema/
+│   │   └── openai.py             # Usage 提取 + sanitize / User 首条
+│   ├── schema/                   # Message.usage / Usage
 │   ├── tools/
 │   │   ├── registry.py           # Middleware 挂载与执行前拦截
 │   │   └── subagent.py           # spawn_subagent → AgentRunner.run_sub
@@ -152,7 +146,7 @@ pip install openai python-dotenv lark-oapi flask
 # 大模型（智谱 OpenAI 兼容）
 ZHIPU_API_KEY=your_zhipu_api_key
 
-# 飞书（main4 / 飞书 Bot 需要）
+# 飞书（demo_feishu_approval / 飞书 Bot 需要）
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_ENCRYPT_KEY=xxx          # 仅 HTTP 回调需要；长连接可空
@@ -163,15 +157,7 @@ FEISHU_VERIFY_TOKEN=xxx
 
 ## 快速启动
 
-### 1. CLI / Compactor（OOM）演示
-
-```bash
-cd tiny-claw
-cp -f mock_log.txt workspace/   # 若已在 workspace/ 可跳过
-python cmd/claw/main.py
-```
-
-当前 `main.py` 还可切换为死循环干预等演示任务（见源码内 prompt）。
+所有演示已合并到 **`cmd/claw/main.py`**。在 `main()` 里**一次只取消注释一个** `demo_*`（互斥）。
 
 让 `AGENTS.md` / Skills 生效时放到 **work_dir**：
 
@@ -180,10 +166,24 @@ cp AGENTS.md workspace/
 mkdir -p workspace/.claw/skills && cp -R .claw/skills/* workspace/.claw/skills/
 ```
 
-### 2. Session / 记忆截断演示
+### 1. CLI / Compactor（OOM） / Reminder
+
+启用 `demo_cli()`：
 
 ```bash
-python cmd/claw/main1.py
+cd tiny-claw
+cp -f mock_log.txt workspace/   # 若已在 workspace/ 可跳过
+python cmd/claw/main.py
+```
+
+源码内 prompt 可切换压缩 / 死循环干预等任务。
+
+### 2. Session / 记忆截断演示
+
+启用 `demo_session_isolation()`：
+
+```bash
+python cmd/claw/main.py
 ```
 
 | 会话 | 目的 |
@@ -191,22 +191,26 @@ python cmd/claw/main1.py
 | Session A（`tmp/project_front`） | 读密钥 → 刷闲聊挤出 Working Memory → 再追问 |
 | Session B（`tmp/project_back`） | 验证跨会话隔离 |
 
-### 3. Plan Mode 演示
+### 3. Plan Mode 演示（当前默认常开）
+
+启用 `demo_plan_mode`（需 `-p`）：
 
 ```bash
-python cmd/claw/main2.py --prompt "在 workspace 里搭一个简单的静态页服务"
+python cmd/claw/main.py -p "在 workspace 里搭一个简单的静态页服务"
 ```
 
 | 项 | 说明 |
 | --- | --- |
-| Session | `task_web_server_01` |
+| Session | `task_web_server_001` |
 | 引擎 | `plan_mode=True` |
 | 外部化 | `PLAN.md` / `TODO.md` 断点续传 |
 
 ### 4. Recovery 自愈演示
 
+启用 `demo_recovery()`：
+
 ```bash
-python cmd/claw/main3.py
+python cmd/claw/main.py
 ```
 
 | 项 | 说明 |
@@ -217,8 +221,10 @@ python cmd/claw/main3.py
 
 ### 5. 飞书高危审批演示（长连接）
 
+启用 `demo_feishu_approval()`（**不要**包 `asyncio.run`）：
+
 ```bash
-python cmd/claw/main4.py
+python cmd/claw/main.py
 ```
 
 | 项 | 说明 |
@@ -236,9 +242,11 @@ python cmd/claw/main4.py
 
 ### 6. Subagent 多智能体协同演示
 
+启用 `demo_subagent()`：
+
 ```bash
 # 请先在 workspace 某路径下放好 config.txt（内含「核心密码」）
-python cmd/claw/main5.py
+python cmd/claw/main.py
 ```
 
 | 项 | 说明 |
@@ -248,6 +256,32 @@ python cmd/claw/main5.py
 | 主线工具 | 四大工具 + `spawn_subagent`（注入 `engine` + 只读 Registry） |
 | 任务 | 委派子智能体找 `config.txt` → 主 Agent `write_file` 写 `answer.txt` |
 | 预期 | 终端可见 `[Subagent]` 工具轨迹；主上下文只收到探索报告 |
+
+### 7. CostTracker 账单演示
+
+启用 `demo_observability()`：
+
+```bash
+python cmd/claw/main.py
+```
+
+| 项 | 说明 |
+| --- | --- |
+| 装饰 | `CostTracker(provider, model, session)` |
+| 预期 | 跑完打印 Session 累计 Input/Output Tokens 与 CNY 费用 |
+
+---
+
+## Working Memory 行为摘要
+
+`Session.get_working_memory(limit)`（默认 limit=20）：
+
+1. 将历史打包为**完整回合**：普通 User / 纯文本 Assistant / `Assistant(tool_calls)+匹配的 ToolResult`
+2. 从尾部按回合累加，避免按裸条数切开 tool 链
+3. 窗口不以普通 User 开头时：优先补**紧邻**的上一条 User；仍缺则插入合成 User（防智谱 `1214`）
+4. 返回深拷贝；Session 全量历史不变
+
+> 裸条数截断曾导致 `system` 后直接跟 `assistant`，易触发智谱 `1214`；回合裁剪 + User 首条即针对此。
 
 ---
 
@@ -281,9 +315,25 @@ python cmd/claw/main5.py
 
 `ReminderInjector.check_and_inject(tool_call, tool_result)`：
 
-- 成功：清空全部失败计数
-- 失败：按 `md5(tool_name + args)` 累加；**≥3** 次注入 User Reminder，要求改策略或向人求助
+| 结果 | 计数行为 | 打断条件 |
+| --- | --- | --- |
+| 成功 | 清空失败计数；同指纹成功次数 +1（换指纹则从 1 重计） | 连续成功 **≥3** → 注入「停止无意义重复 / 推进或收尾」 |
+| 失败 | 清空成功计数；同指纹失败次数 +1 | 连续失败 **≥3** → 注入「改策略或向人求助」（原逻辑） |
+
+- 指纹：`md5(tool_name + args)`
 - 引擎在 Observation 写入 Session 后调用；简化策略取本轮**第一个**工具结果分析
+
+> 仅防「失败死循环」时，同参反复成功（如反复 `curl` 同一 URL）不会触发；现已覆盖。
+
+---
+
+## CostTracker 行为摘要
+
+`CostTracker(next_provider, model_name, session)`（`internal/observability/tracker.py`）：
+
+1. 装饰 `LLMProvider.generate`，透传调用
+2. 从返回 `Message.usage` 读取 prompt / completion tokens
+3. 按内置单价表（如 `glm-4.5-air` / `glm-4.6v`）估算 CNY，调用 `session.record_usage`
 
 ---
 
@@ -327,7 +377,7 @@ engine.run（主线）
 
 要点：
 
-- `AgentRunner` Protocol 打破 `tools` ↔ `engine` 循环依赖；`main5` 把主引擎注入为 runner
+- `AgentRunner` Protocol 打破 `tools` ↔ `engine` 循环依赖；`demo_subagent` 把主引擎注入为 runner
 - 子循环**不依赖**外部 Session，打完即弃；失败时把错误文案当 Observation 交回主 Agent
 - 成功返回形如 `【子智能体探索报告】:\n...`
 
@@ -335,8 +385,7 @@ engine.run（主线）
 
 ## 飞书模式
 
-- **`main4.py`**：推荐入口；WebSocket 长连接 + 审批卡片
-- **`main.py`**：飞书 HTTP/WS 代码仍注释保留，可按需恢复
+- 在 `main.py` 启用 `demo_feishu_approval()`：WebSocket 长连接 + 审批卡片
 - `FeishuBot`：可绑定固定 Session；处理文本审批口令与 `card.action.trigger`
 
 ### 常见问题
@@ -350,11 +399,11 @@ engine.run（主线）
 | 高危指令只有口头拒绝、无审批卡片 | 模型未调工具；确认 `approval_gate=True` 并重启清历史 |
 | 审批日志有、飞书无卡片 | 旧版在事件循环里 `create_task` 后阻塞；现已独立线程发送 |
 | `429` / 超时 | 智谱限流或网络 |
-| 智谱 `1214` | 已合并 Thinking/Action + sanitize |
-| Turn 2「不记得密钥」 | Working Memory 截断（`main1` 预期） |
+| 智谱 `1214` | Thinking/Action 合并 + WM 回合裁剪/User 首条 + sanitize |
+| Turn 2「不记得密钥」 | Working Memory 截断（Session 隔离演示预期） |
 | `[Compactor] 内存告警` | 超水位线（预期） |
-| `注入救援指南` | Recovery 触发（`main3` 预期） |
-| Reminder 死循环干预 | 同指纹失败 ≥3（`main.py` 死循环演示预期） |
+| `注入救援指南` | Recovery 触发（Recovery 演示预期） |
+| Reminder 死循环干预 | 同指纹失败或成功 ≥3（日志含「成功死循环干预」） |
 | 子智能体找不到密码 | `workspace` 下缺少 `config.txt`，或未走 `spawn_subagent` |
 | 子智能体超 10 轮被召回 | 任务指令过宽；请主 Agent 给出更明确的 `task_prompt` |
 | `git push` 连不上 github.com | 本机网络/代理问题，与仓库无关 |
@@ -369,19 +418,24 @@ engine.run（主线）
 | --- | --- |
 | `append(*msgs)` | 追加全量历史 |
 | `clear()` | 清空历史 |
-| `get_working_memory(limit)` | 最近 N 条；丢弃孤儿 ToolResult |
+| `record_usage(...)` | 累加 Token / 费用 |
+| `get_working_memory(limit)` | 按完整回合裁剪；保证 User 开头 |
 | `global_session_mgr` | 模块级单例 |
 
 ### AgentEngine（`internal/engine/loop.py`）
 
 - 构造：`enable_thinking` / `plan_mode` / `approval_gate` / `compactor` / `recovery` / `injector`
 - 默认：`Compactor(20000, 6)`、`RecoveryManager()`、`ReminderInjector()`
-- `run`：compact → Thinking/Action 合并 → 工具（Recovery）→ Reminder
+- `run`：WM → compact → Thinking/Action 合并 → 工具（Recovery）→ Reminder（失败/成功）
 - `run_sub`：一次性只读子循环（供 `spawn_subagent`）；最多 10 轮；不写主 Session
 
 ### ReminderInjector（`internal/engine/reminder.py`）
 
 见上文「Reminder 行为摘要」。
+
+### CostTracker（`internal/observability/tracker.py`）
+
+见上文「CostTracker 行为摘要」。
 
 ### Registry（`internal/tools/registry.py`）
 
@@ -407,7 +461,7 @@ engine.run（主线）
 
 ### Provider / Reporter / Tools
 
-- Provider：`_sanitize_openai_messages`
+- Provider：提取 `Usage`；`_sanitize_openai_messages` + system 后强制 User 首条
 - Reporter：`TerminalReporter` / `FeishuReporter`（含 `send_approval_card`）
 - Tools：四大基础工具 + 可选 `spawn_subagent`，均受 `work_dir` 约束
 
@@ -419,9 +473,10 @@ engine.run（主线）
 
 | 日期 | 版本 / 标签 | 摘要 |
 | --- | --- | --- |
-| 2026-10-28 | — | Subagent：`spawn_subagent` + `AgentEngine.run_sub` 只读探路者；`main5.py` 多智能体协同演示 |
-| 2026-10-27 | — | Reminder 死循环打断；Registry Middleware；飞书审批卡片 + `card.action.trigger`；`approval_gate`；`main4.py` 长连接演示 |
-| 2026-10-27 | — | Recovery；`main3.py`；Plan Mode + `main2.py`；Compactor 默认 20000；Thinking/Action 合并与 sanitize 防 1214 |
+| 2026-10-29 | — | WM 按回合裁剪 + User 首条防 1214；Reminder 覆盖「成功死循环」；CostTracker / Usage；演示入口合并为 `main.py` |
+| 2026-10-28 | — | Subagent：`spawn_subagent` + `AgentEngine.run_sub` 只读探路者 |
+| 2026-10-27 | — | Reminder 失败死循环；Registry Middleware；飞书审批卡片 + `card.action.trigger`；`approval_gate` |
+| 2026-10-27 | — | Recovery；Plan Mode；Compactor 默认 20000；Thinking/Action 合并与 sanitize 防 1214 |
 | 2026-10-24 | — | Compactor；WM=20；OOM 与 `workspace` 边界 |
 | 2026-10-24 | — | Session / Working Memory；引擎无状态 |
 | 2026-10-22 | — | Composer + Skills、CLI/`workspace`、TerminalReporter |
@@ -431,26 +486,27 @@ engine.run（主线）
 ### 迭代备注（自由文本）
 
 ```text
+# 2026-10-29（WM / Reminder 成功循环 / 账单 / 统一入口）
+# - session.get_working_memory：按完整回合裁剪；紧邻 User / 合成 User
+# - openai：sanitize 后 system 后非 user 则插占位 user
+# - reminder：同指纹连续成功 ≥3 亦注入打断（保留失败 ≥3）
+# - Usage + Session.record_usage；CostTracker 装饰 Provider
+# - cmd/claw/main.py：合并原 main～main6 为 demo_*，注释互斥切换
+
 # 2026-10-28（Subagent）
-# - subagent.py：spawn_subagent；AgentRunner Protocol 打破循环依赖
+# - subagent.py：spawn_subagent；AgentRunner Protocol
 # - loop.py：run_sub 只读子循环（最多 10 轮）；Reporter 前缀 [Subagent]
-# - main5.py：只读沙箱 + 主线全工具；委派找 config.txt → 写 answer.txt
 
 # 2026-10-27（Reminder / Middleware / 飞书审批）
 # - reminder.py：同指纹连续失败 ≥3 注入 User Reminder
-# - registry.py：MiddlewareFunc + use()；Execute 前拦截
-# - approval.py：ApprovalManager、交互卡片 JSON、独立线程发卡片
-# - bot.py：card.action.trigger；approve/reject 文本兜底；send_approval_card
-# - composer/loop：approval_gate；main4 长连接 + 审批演示
-# - session.clear()：演示入口清历史，避免口头拒答污染
+# - registry Middleware；approval 交互卡片；approval_gate
 
 # 2026-10-27（Recovery / Plan Mode / 1214）
 # - recovery.py；plan_mode；Compactor 20000
 # - Thinking/Action 合并；openai sanitize
-# - main2 / main3
 
 # 2026-10-24（Compactor / Session）
-# - compactor.py；session.py；main / main1
+# - compactor.py；session.py
 
 # 2026-10-22
 # - composer / skill；CLI + TerminalReporter
@@ -463,12 +519,15 @@ engine.run（主线）
 ## 路线图
 
 - [ ] `requirements.txt` / `pyproject.toml`
-- [ ] CLI / 飞书 / 演示入口用启动参数切换
+- [ ] CLI / 飞书 / 演示入口用启动参数切换（当前靠 `main()` 注释互斥）
 - [ ] Session 历史 JSONL 落盘
 - [ ] Compactor / WM 阈值可配置或按 token 预算
 - [x] Recovery：工具失败特征救援
 - [x] Plan Mode：`PLAN.md` / `TODO.md`
 - [x] Reminder：连续失败死循环打断
+- [x] Reminder：连续成功死循环打断
+- [x] WM 回合裁剪 + User 首条（防 1214）
+- [x] CostTracker / Usage 账单
 - [x] Middleware + 飞书人工审批卡片
 - [x] Subagent：只读探路者 + 摘要回流
 - [ ] `internal/memory` 跨会话长期记忆

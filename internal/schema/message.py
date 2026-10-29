@@ -13,6 +13,20 @@ class Role(str, Enum):
     ASSISTANT = "assistant"
     
 @dataclass
+class Usage:
+    """单次大模型 API 调用的 Token 消耗。"""
+
+    prompt_tokens: int = 0  # 输入的 Token 数量
+    completion_tokens: int = 0  # 产生的 Token 数量
+
+    def to_dict(self) -> dict:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+        }
+
+
+@dataclass
 class ToolCall:
     """模型请求调用某个具体工具"""
     id: str
@@ -34,7 +48,9 @@ class Message:
     
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: Optional[str] = None
-    
+    # 若为大模型 (Assistant) 回复，可存放本次调用的 Token 消耗
+    usage: Optional[Usage] = None
+
     def to_dict(self) -> dict:
         data = {
             "role": self.role.value,
@@ -46,6 +62,9 @@ class Message:
 
         if self.tool_call_id:
             data["tool_call_id"] = self.tool_call_id
+
+        if self.usage is not None:
+            data["usage"] = self.usage.to_dict()
         
         return data
     

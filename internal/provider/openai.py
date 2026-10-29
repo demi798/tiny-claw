@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from internal.provider.interface import LLMProvider
-from internal.schema.message import Message, Role, ToolCall, ToolDefinition
+from internal.schema.message import Message, Role, ToolCall, ToolDefinition, Usage
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,20 @@ class OpenAIProvider(LLMProvider):
         if not resp.choices:
             raise RuntimeError("API 返回了空的 Choices")
 
-        return _from_openai_message(resp.choices[0].message)
+        result_msg = _from_openai_message(resp.choices[0].message)
+
+        # 【新增】提取 Usage 信息，供 Session / Tracker 累加账单
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            if prompt_tokens > 0 or completion_tokens > 0:
+                result_msg.usage = Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
+        return result_msg
 
 
 def _to_openai_messages(messages: list[Message]) -> list[dict[str, Any]]:
@@ -229,7 +242,38 @@ def _sanitize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
             dropped,
             len(sanitized),
         )
-    return sanitized
+    # 智谱要求 system 之后首条必须是 user，否则易触发 1214
+    return _ensure_openai_user_first(sanitized)
+
+
+def _ensure_openai_user_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """若 system 后首条不是 user，插入占位 user，作为 1214 最后一道保险。"""
+    if not messages:
+        return messages
+
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(messages) and messages[i].get("role") == "system":
+        out.append(messages[i])
+        i += 1
+
+    rest = messages[i:]
+    if rest and rest[0].get("role") != "user":
+        logger.warning(
+            "[Provider] system 后首条为 %s（非 user），已插入占位 user 以防 1214",
+            rest[0].get("role"),
+        )
+        out.append(
+            {
+                "role": "user",
+                "content": (
+                    "（系统提示：早期对话上下文已压缩。"
+                    "请根据近期工具执行结果，继续完成用户任务。）"
+                ),
+            }
+        )
+    out.extend(rest)
+    return out
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:

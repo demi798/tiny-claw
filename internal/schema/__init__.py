@@ -6,6 +6,7 @@ from internal.schema.message import (
     ToolCall,
     ToolDefinition,
     ToolResult,
+    Usage,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ToolCall",
     "ToolDefinition",
     "ToolResult",
+    "Usage",
 ]
