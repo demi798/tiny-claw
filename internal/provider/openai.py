@@ -190,7 +190,12 @@ def _sanitize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
         j = i + 1
         while j < n and messages[j].get("role") == "tool":
             tid = messages[j].get("tool_call_id")
-            if tid in expected_ids and tid not in matched_ids:
+            # tool_call_id 必须是非空 str，才能安全写入 set[str]
+            if (
+                isinstance(tid, str)
+                and tid in expected_ids
+                and tid not in matched_ids
+            ):
                 matched_tools.append(messages[j])
                 matched_ids.add(tid)
             else:

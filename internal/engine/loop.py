@@ -270,9 +270,13 @@ class AgentEngine:
         await asyncio.gather(
             *(_run_one(i, call) for i, call in enumerate(tool_calls))
         )
-        if any(item is None for item in pairs):
-            raise RuntimeError("子智能体并行工具执行后观察结果不完整")
-        return [msg for msg, _ in pairs if msg is not None]
+        # 显式收窄类型，避免 mypy 仍认为 pairs 含 None
+        completed: list[tuple[Message, ToolResult]] = []
+        for item in pairs:
+            if item is None:
+                raise RuntimeError("子智能体并行工具执行后观察结果不完整")
+            completed.append(item)
+        return [msg for msg, _ in completed]
 
     async def _run_thinking(
         self,

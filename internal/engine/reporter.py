@@ -14,12 +14,12 @@ class Reporter(ABC):
     @abstractmethod
     async def on_thinking(self) -> None:
         """模型开始慢思考 (Reasoning) 时调用。"""
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     async def on_tool_call(self, tool_name: str, args: str) -> None:
         """模型决定调用工具时调用。"""
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     async def on_tool_result(
@@ -30,9 +30,9 @@ class Reporter(ABC):
         is_error: bool,
     ) -> None:
         """工具执行完毕并返回结果时调用。"""
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     async def on_message(self, content: str) -> None:
         """模型宣告任务完成，向用户输出最终纯文本回答时调用。"""
-        raise NotImplementedError
+        ...

@@ -109,5 +109,15 @@ def new_cost_tracker(
     model_name: str,
     session: Session | None = None,
 ) -> CostTracker:
-    """构造被监控的 Provider"""
+    """构造被监控的 Provider。
+
+    已废弃：请直接使用 ``CostTracker(...)``。
+    """
+    import warnings
+
+    warnings.warn(
+        "new_cost_tracker() 已废弃，请改用 CostTracker(...)",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return CostTracker(next_provider, model_name, session)

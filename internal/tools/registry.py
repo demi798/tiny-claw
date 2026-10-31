@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from internal.observability.trace import start_span
 from internal.schema import ToolCall, ToolDefinition, ToolResult
@@ -28,12 +29,12 @@ class BaseTool(ABC):
     @abstractmethod
     def name(self) -> str:
         """返回工具的全局唯一名称（大模型通过该名字调用）。"""
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def definition(self) -> ToolDefinition:
         """返回提交给大模型的元信息与参数 JSON Schema。"""
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     async def execute(self, args: bytes) -> str:
@@ -41,42 +42,39 @@ class BaseTool(ABC):
 
         反序列化由各个具体工具自行处理；失败时抛出异常。
         """
-        raise NotImplementedError
+        ...
 
 
-class Registry(ABC):
-    """工具的注册与分发接口。"""
+@runtime_checkable
+class Registry(Protocol):
+    """工具注册与分发契约（结构化类型，避免仅一实现时的 ABC 负担）。"""
 
-    @abstractmethod
     def register(self, tool: BaseTool) -> None:
         """挂载一个新工具到系统中。"""
-        raise NotImplementedError
+        ...
 
-    @abstractmethod
     def use(self, mw: MiddlewareFunc) -> None:
-        """【新增】挂载全局 Middleware。"""
-        raise NotImplementedError
+        """挂载全局 Middleware。"""
+        ...
 
-    @abstractmethod
     def get_available_tools(self) -> list[ToolDefinition]:
         """返回当前已挂载工具的 Schema，供主循环交给 Provider。"""
-        raise NotImplementedError
+        ...
 
-    @abstractmethod
     async def execute(self, call: ToolCall) -> ToolResult:
         """路由并执行模型请求的工具调用。
 
         业务失败应通过 ToolResult.is_error 表达，而不是抛异常。
         """
-        raise NotImplementedError
+        ...
 
 
-class ToolRegistry(Registry):
+class ToolRegistry:
     """Registry 的默认实现：用工具名做 O(1) 路由。"""
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
-        # 【新增】保存挂载的中间件链
+        # 保存挂载的中间件链
         self._middlewares: list[MiddlewareFunc] = []
 
     def register(self, tool: BaseTool) -> None:
@@ -154,8 +152,16 @@ class ToolRegistry(Registry):
             span.end_span()
 
 
-def new_registry() -> Registry:
-    """创建默认工具注册表。"""
+def new_registry() -> ToolRegistry:
+    """创建默认工具注册表。
+
+    已废弃：请直接使用 ``ToolRegistry()``。
+    """
+    warnings.warn(
+        "new_registry() 已废弃，请改用 ToolRegistry()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return ToolRegistry()
 
 

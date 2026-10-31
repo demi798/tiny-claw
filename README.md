@@ -33,6 +33,11 @@
 | CLI 入口 | `cmd/claw/main.py`：`-p` 任务 + 可选 `-d`/`-s`；默认 `plan_mode` + CostTracker + Tracing | ✅ |
 | 场景演示入口 | `cmd/claw/main_case.py`：各 `demo_*` 注释互斥（Session / Recovery / 飞书 / Subagent 等） | ✅ |
 | AgentOps 飞书运维 | `cmd/agentops/main.py`：长连接 + 高危 Middleware + 按 Session 工厂组装引擎 / CostTracker | ✅ |
+| 可安装包 | `pyproject.toml` + `pip install -e .`；入口不再依赖 `sys.path` hack | ✅ |
+| 依赖注入 | `create_session_manager` / `create_approval_manager`；`FeishuBot` 可注入；入口显式装配 | ✅ |
+| 工具注册表 | `ToolRegistry` 具体类 + `Registry` Protocol；`new_registry()` 仅作兼容别名 | ✅ |
+| 单元测试 | `tests/` + `pytest`（WM / Compactor / Reminder / sanitize / Recovery 等） | ✅ |
+| 静态检查 | `ruff` / `mypy` 配置写入 `pyproject.toml` | ✅ |
 | 多渠道（钉钉 / WebUI 等） | 可基于 Reporter 扩展 | 📋 |
 
 ---
@@ -80,11 +85,13 @@
 - **Benchmark**：每用例独立 `workspace/{id}_{ts}/` 沙箱；Setup → Agent → Validate（exit 0 算过）；账单记在独立 Session。
 - **Middleware**：工具真正执行前可拦截；高危命令可挂起等待人类审批。
 - **飞书并发**：`FeishuBot` 用工厂按 Session 建引擎；`contextvars` 传递专属 `FeishuReporter`，避免多群聊串发。
+- **依赖注入**：入口用 `create_session_manager()` / `create_approval_manager()` 构造实例，并注入 `FeishuBot` 与 Middleware（二者须共享同一 `ApprovalManager`）；`global_*` 仅兼容旧调用。
 - **Approval Gate**：提示模型勿口头拒答，安全由中间件 + 人类把关。
 - **Subagent**：主 Agent 通过 `spawn_subagent` 委派；子循环不写主 Session，只回摘要。
 - **Plan Mode**：强制维护「当前活跃」`PLAN`/`TODO` 文件对（默认同名；多任务并存时用 `PLAN1.md`/`TODO1.md` 等编号对）。
 - **调用约定**：先 `session.append(用户输入)`，再 `engine.run(session, reporter)`。
 - **工具边界**：只能访问 `session.work_dir`（默认 `./workspace`）。
+- **工程化**：先 `pip install -e ".[dev]"`，再跑入口 / `pytest` / `mypy` / `ruff`。
 
 ---
 
@@ -100,16 +107,17 @@ tiny-claw/
 │   │   └── main.py               # AgentOps：飞书长连接 + 审批 Middleware + 引擎工厂
 │   └── bench/
 │       └── main.py               # Harness Benchmark 跑分入口
+├── tests/                        # pytest 单测（WM / Compactor / Reminder / sanitize 等）
 ├── workspace/                    # 默认工作区（.gitignore）
 │   ├── .claw/
-│   │   └── skills/
+│   │   ├── skills/
 │   │   │   └── git-workflow/SKILL.md
-│   │   ├── AGENTS.md
+│   │   └── AGENTS.md
 │   └── ...
-├── internal/
+├── internal/                     # 可安装包（pip install -e .）
 │   ├── engine/
 │   │   ├── loop.py               # run + run_sub；Compactor / Recovery / Reminder / Tracing
-│   │   ├── session.py            # WM 回合裁剪 + record_usage
+│   │   ├── session.py            # WM 回合裁剪 + record_usage + create_session_manager
 │   │   ├── reminder.py           # 失败/成功死循环打断（成功打断提及编号 PLAN/TODO）
 │   │   ├── reporter.py
 │   │   └── terminal_reporter.py
@@ -119,19 +127,22 @@ tiny-claw/
 │   │   ├── compactor.py
 │   │   └── recovery.py
 │   ├── eval/
-│   │   └── benchmark.py          # TestCase / TestResult / BenchmarkRunner
+│   │   └── benchmark.py          # TestCase / TestResult / BenchmarkRunner.from_model
 │   ├── observability/
 │   │   ├── tracker.py            # CostTracker 账单装饰器
 │   │   └── trace.py              # Span + contextvars + 导出 JSON
 │   ├── feishu/
-│   │   ├── bot.py                # 工厂 + contextvars Reporter；长连接/卡片/口令
-│   │   └── approval.py           # ApprovalManager + is_dangerous_command + 卡片 JSON
+│   │   ├── bot.py                # 工厂 + 可注入 session/approval；contextvars Reporter
+│   │   └── approval.py           # ApprovalManager + create_approval_manager + 卡片 JSON
 │   ├── provider/
 │   │   └── openai.py             # Usage 提取 + sanitize / User 首条
 │   ├── schema/                   # Message.usage / Usage
-│   ├── tools/
-│       ├── registry.py           # Middleware + Tool.Execute Span
+│   └── tools/
+│       ├── registry.py           # ToolRegistry + Registry Protocol + Middleware + Span
 │       └── subagent.py           # spawn_subagent → AgentRunner.run_sub
+├── pyproject.toml                # 包元数据 + ruff / mypy / pytest 配置
+├── requirements.txt              # 运行依赖摘要（以 pyproject.toml 为准）
+├── todo.md                       # 工程规范整改清单（P0–P2 已完成）
 ├── .env
 └── README.md
 ```
@@ -141,11 +152,15 @@ tiny-claw/
 ## 环境要求
 
 - Python 3.10+（推荐 3.11 / 3.13）
-- 依赖：
+- 推荐用可编辑安装（声明与工具链以 `pyproject.toml` 为准）：
 
 ```bash
-pip install openai python-dotenv lark-oapi flask
+cd tiny-claw
+pip install -e ".[dev]"   # 含运行依赖 + pytest / mypy / ruff
+# 仅运行依赖时：pip install -e .
 ```
+
+> `requirements.txt` 仅为依赖摘要，便于查阅；安装请优先走 `pyproject.toml`。
 
 ---
 
@@ -167,6 +182,13 @@ FEISHU_VERIFY_TOKEN=xxx
 ## 快速启动
 
 正式 CLI 入口是 **`cmd/claw/main.py`**（需 `-p`）。飞书运维用 **`cmd/agentops/main.py`**（长连接）。专题场景（双 Session / Recovery / 飞书演示 / Subagent 等）见 **`cmd/claw/main_case.py`**，在其 `main()` 里一次只取消注释一个 `demo_*`。
+
+首次使用请先安装包（否则 `from internal...` 无法解析）：
+
+```bash
+cd tiny-claw
+pip install -e ".[dev]"
+```
 
 让 `AGENTS.md` / Skills 生效时放到 **work_dir**（默认可用 `workspace/`）：
 
@@ -238,7 +260,8 @@ python cmd/agentops/main.py
 | 工作区 | `./workspace` |
 | 连接 | `lark.ws.Client` 长连接（`use_long_connection=True`，无需 ngrok） |
 | 引擎 | 工厂按 Session 挂 `CostTracker`；`enable_thinking=False`，`plan_mode=False` |
-| Middleware | `is_dangerous_command` 命中 → `reporter_from_context()` + `wait_for_approval` |
+| 装配 | `create_session_manager` + `create_approval_manager` 注入 `FeishuBot` 与 Middleware（同实例） |
+| Middleware | `is_dangerous_command` 命中 → `reporter_from_context()` + `approval_mgr.wait_for_approval` |
 | 黑名单摘要 | `read_file` 放行；`write_file`/`edit_file` 一律审批；`bash` 匹配 `rm -r` / `sudo` / `drop` / `>*.py` / `nginx -s` / `systemctl` / `kill` 等 |
 
 ### 4. Harness Benchmark 跑分
@@ -368,17 +391,17 @@ Agent.Run
 3. `TestCase`：`id` / `name` / `task_prompt` / `validate_script` / 可选 `setup_script` / `max_turns`（字段已留，限轮尚未接入引擎）
 4. `TestResult`：`passed` / `total_cost_cny` / `duration_ms` / `error_msg`
 
-入口：`cmd/bench/main.py` 组装微型评测集并调用 `new_benchmark_runner(model).run_suite(...)`。
+入口：`cmd/bench/main.py` 组装微型评测集并调用 `BenchmarkRunner.from_model(model).run_suite(...)`（`new_benchmark_runner` 已废弃，仍可用）。
 
 ---
 
 ## Middleware / 人工审批摘要
 
-`Registry.use(mw)` → `Execute` 前依次调用；`allowed=False` 时返回 `is_error=True` 及原因。
+`ToolRegistry.use(mw)` → `Execute` 前依次调用；`allowed=False` 时返回 `is_error=True` 及原因。
 
-`ApprovalManager`（`global_approval_mgr`）：
+`ApprovalManager`（推荐 `create_approval_manager()` 后注入 Bot + Middleware；`global_approval_mgr` 仅兼容）：
 
-1. `wait_for_approval`：登记 TaskID 队列 → 发交互卡片（独立线程发送，避免堵死事件循环）→ `Queue.get()` 阻塞
+1. `wait_for_approval`：登记 TaskID 队列 → 发交互卡片（独立线程发送，避免堵死事件循环）→ `Queue.get()` 阻塞；同时 `logger.warning` 打印 TaskID 口令兜底
 2. `resolve_approval`：卡片按钮或文本口令唤醒
 3. `is_dangerous_command`：
    - `read_file`：白名单放行
@@ -430,8 +453,9 @@ engine.run（主线）
 
 - **推荐入口**：`python cmd/agentops/main.py`（长连接 + Middleware + 引擎工厂）
 - 演示入口：`main_case.py` 启用 `demo_feishu_approval()`（同样长连接 + 审批卡片）
-- `FeishuBot(factory, work_dir=...)`：
+- `FeishuBot(factory, work_dir=..., session_mgr=..., approval_mgr=...)`：
   - 按 `chat_id` 隔离 Session；`factory(session)` 为每会话挂专属 `CostTracker` 引擎
+  - **须**与 Middleware 共用同一 `approval_mgr`，否则卡片/口令无法唤醒挂起的审批
   - `context_with_reporter` / `reporter_from_context`（`contextvars`）避免多会话 Reporter 串发
   - 处理文本口令 `approve`/`reject` 与 `card.action.trigger`
 
@@ -439,6 +463,7 @@ engine.run（主线）
 
 | 现象 | 可能原因 |
 | --- | --- |
+| `ModuleNotFoundError: internal` | 未执行 `pip install -e .`（或 `.[dev]`） |
 | 找不到 `mock_log.txt` | 文件不在 `workspace/` |
 | 飞书无消息日志 | 未选长连接 / 未订阅事件 / 未发版 |
 | 卡片按钮无反应 | 未添加 `card.action.trigger` 回调或未发版 |
@@ -471,7 +496,8 @@ engine.run（主线）
 | `clear()` | 清空历史 |
 | `record_usage(...)` | 累加 Token / 费用 |
 | `get_working_memory(limit)` | 按完整回合裁剪；保证 User 开头 |
-| `global_session_mgr` | 模块级单例 |
+| `create_session_manager()` | **推荐**：显式工厂，由入口构造并注入 |
+| `global_session_mgr` | 兼容旧调用的默认实例；新代码勿依赖 |
 
 ### AgentEngine（`internal/engine/loop.py`）
 
@@ -482,11 +508,11 @@ engine.run（主线）
 
 ### ReminderInjector（`internal/engine/reminder.py`）
 
-见上文「Reminder 行为摘要」。
+见上文「Reminder 行为摘要」。主 API：`ReminderInjector()`（`new_reminder_injector` 已废弃）。
 
 ### CostTracker（`internal/observability/tracker.py`）
 
-见上文「CostTracker 行为摘要」。
+见上文「CostTracker 行为摘要」。主 API：`CostTracker(...)`（`new_cost_tracker` 已废弃）。
 
 ### Trace（`internal/observability/trace.py`）
 
@@ -494,27 +520,30 @@ engine.run（主线）
 
 ### Benchmark（`internal/eval/benchmark.py`）
 
-见上文「Benchmark 行为摘要」。入口：`cmd/bench/main.py`。
+见上文「Benchmark 行为摘要」。入口：`cmd/bench/main.py` → `BenchmarkRunner.from_model(...)`。
 
-### Registry（`internal/tools/registry.py`）
+### Registry / ToolRegistry（`internal/tools/registry.py`）
 
+- `Registry`：`Protocol` 契约；`ToolRegistry`：默认实现（主 API：`ToolRegistry()`）
 - `register` / `use` / `get_available_tools` / `execute`
 - Middleware 拦截必须 `is_error=True`，强制模型阅读拒绝理由
 - `execute` 内开启 `Tool.Execute` Span（`try/finally` 结束）
+- `new_registry()`：兼容别名，已废弃
 
 ### SubagentTool（`internal/tools/subagent.py`）
 
 - 工具名：`spawn_subagent`；参数：`task_prompt`
 - 注入 `AgentRunner`（通常即主引擎）+ 只读 Registry + 可选 Reporter
+- 主 API：`SubagentTool(...)`（`new_subagent_tool` 已废弃）
 - 见上文「Subagent 行为摘要」
 
 ### FeishuBot / ApprovalManager
 
 | 组件 | 作用 |
 | --- | --- |
-| `FeishuBot` | 工厂建引擎；Context 传 Reporter；长连接事件 + 口令/卡片审批 |
-| `ApprovalManager` | 见上文「Middleware / 人工审批摘要」；`build_approval_card` 生成通过/拒绝按钮卡片 |
-| `cmd/agentops/main.py` | AgentOps 正式飞书运维入口 |
+| `FeishuBot` | 工厂建引擎；可注入 `session_mgr` / `approval_mgr`；Context 传 Reporter；长连接 + 口令/卡片审批 |
+| `ApprovalManager` | 见上文「Middleware / 人工审批摘要」；`create_approval_manager()` 推荐；`build_approval_card` 生成卡片 |
+| `cmd/agentops/main.py` | AgentOps 正式飞书运维入口（显式注入 Session/Approval） |
 
 ### PromptComposer / SkillLoader
 
@@ -537,6 +566,7 @@ engine.run（主线）
 
 | 日期 | 版本 / 标签 | 摘要 |
 | --- | --- | --- |
+| 2026-10-31 | — | 工程规范整改（P0–P2）：`pyproject.toml` 可编辑安装；去掉 `sys.path`；`ToolRegistry` + DI 工厂；`tests/` + ruff/mypy；README/todo 对齐 |
 | 2026-10-29 | — | AgentOps：`cmd/agentops/main.py` 飞书长连接；`FeishuBot` 工厂 + contextvars Reporter；`is_dangerous_command` 收紧（写文件一律审批 + nginx/systemctl/kill） |
 | 2026-10-29 | — | Plan Mode：未完成新开 `PLAN{N}`/`TODO{N}`；已完成删旧覆盖；Reminder 成功打断支持编号文件对 |
 | 2026-10-29 | — | Harness Benchmark：`eval/benchmark.py` + `cmd/bench/main.py`；隔离沙箱 Setup/Validate；Python 用例 |
@@ -554,6 +584,13 @@ engine.run（主线）
 ### 迭代备注（自由文本）
 
 ```text
+# 2026-10-31（工程规范 P0–P2，见 TASK.md）
+# - pyproject.toml：可编辑安装；ruff/mypy/pytest 配置；去掉入口 sys.path hack
+# - ToolRegistry + Registry Protocol；create_session_manager / create_approval_manager 注入
+# - FeishuBot(session_mgr=, approval_mgr=)；new_* 工厂标 DeprecationWarning
+# - tests/：WM / Compactor / Reminder / sanitize / fuzzy_replace / Recovery
+# - message 注解统一 X|None / dict[str, Any]；approval print → logger.warning
+
 # 2026-10-29（AgentOps / 飞书防串发 / 审批黑名单）
 # - cmd/agentops/main.py：长连接 + Middleware + engine factory + CostTracker
 # - bot.py：AgentEngineFactory；context_with_reporter / reporter_from_context
@@ -607,7 +644,8 @@ engine.run（主线）
 
 ## 路线图
 
-- [ ] `requirements.txt` / `pyproject.toml`
+- [x] `requirements.txt` / `pyproject.toml`（可编辑安装 + 工具链配置）
+- [x] 工程规范整改 P0–P2（测试 / DI / Protocol / lint；见 `todo.md`）
 - [ ] 专题演示并入 CLI 启动参数（当前：`main.py` 通用任务，`agentops` 飞书运维，`main_case.py` 注释互斥）
 - [ ] Session 历史 JSONL 落盘
 - [ ] Compactor / WM 阈值可配置或按 token 预算
@@ -627,6 +665,7 @@ engine.run（主线）
 - [ ] `internal/memory` 跨会话长期记忆
 - [ ] Provider 429/超时重试
 - [ ] 更多 Reporter
+- [ ] 移除已废弃的 `new_*` / `global_*` 兼容别名（择机）
 - [ ] ……（在此追加）
 
 ---
@@ -637,6 +676,16 @@ engine.run（主线）
 - 改一处功能时尽量不破坏已正确能力
 - 密钥只放 `.env`
 - 演示用文件放进对应 `work_dir`（默认 `workspace/`）
+- 新代码优先：`ToolRegistry()`、`create_session_manager()`、`create_approval_manager()`、类构造 / `from_model`；避免新增对 `global_*` / `new_*` 的依赖
+- 工程整改进度见 [`todo.md`](./todo.md)（P0–P2 已完成）
+- 开发依赖与检查（配置见 `pyproject.toml`）：
+
+```bash
+pip install -e ".[dev]"
+ruff check internal cmd tests
+mypy internal
+pytest
+```
 
 ---
 

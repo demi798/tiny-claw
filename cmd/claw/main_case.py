@@ -10,22 +10,14 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
 
 from dotenv import load_dotenv
 
-_ROOT = Path(__file__).resolve().parents[2]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-load_dotenv(_ROOT / ".env")
-load_dotenv()
-
 from internal.engine.loop import AgentEngine
-from internal.engine.session import Session, global_session_mgr
+from internal.engine.session import Session, create_session_manager
 from internal.engine.terminal_reporter import TerminalReporter
 from internal.observability.tracker import CostTracker
 from internal.provider.interface import LLMProvider
@@ -34,9 +26,14 @@ from internal.schema.message import Message, Role, ToolCall
 from internal.tools.bash import BashTool
 from internal.tools.edit_file import EditFileTool
 from internal.tools.read_file import ReadFileTool
-from internal.tools.registry import Registry, new_registry
+from internal.tools.registry import Registry, ToolRegistry
 from internal.tools.subagent import SubagentTool
 from internal.tools.write_file import WriteFileTool
+
+# 从仓库根目录加载 .env（需先 pip install -e .）
+_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_ROOT / ".env")
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,7 +122,7 @@ async def demo_cli() -> None:
     """CLI 单次任务。默认跑 Reminder 死循环干预；其它 prompt 见函数内注释。"""
     _require_api_key()
     work_dir = _workspace_dir()
-    registry = new_registry()
+    registry = ToolRegistry()
     _register_basic_tools(registry, work_dir)
     engine = _new_engine(_new_provider(), registry)
     reporter = TerminalReporter()
@@ -155,7 +152,7 @@ async def demo_cli() -> None:
         """
     ).strip()
 
-    session = global_session_mgr.get_or_create(session_id, work_dir)
+    session = create_session_manager().get_or_create(session_id, work_dir)
     logger.info("🚀 [main] CLI 演示 session=%s", session_id)
     await _run_once(engine, session, prompt, reporter)
 
@@ -170,13 +167,13 @@ async def demo_session_isolation() -> None:
     _FRONT_DIR.mkdir(parents=True, exist_ok=True)
     _BACK_DIR.mkdir(parents=True, exist_ok=True)
 
-    registry = new_registry()
+    registry = ToolRegistry()
     registry.register(ReadFileTool(str(_FRONT_DIR)))
     engine = _new_engine(_new_provider(), registry)
     reporter = TerminalReporter()
 
     async def _session_a() -> None:
-        session_a = global_session_mgr.get_or_create("chat_front_001", str(_FRONT_DIR))
+        session_a = create_session_manager().get_or_create("chat_front_001", str(_FRONT_DIR))
         logger.info("\n>>> [Session A / T1] 查 README 密钥")
         await _run_once(
             engine,
@@ -197,7 +194,7 @@ async def demo_session_isolation() -> None:
 
     async def _session_b() -> None:
         await asyncio.sleep(1)
-        session_b = global_session_mgr.get_or_create("chat_back_002", str(_BACK_DIR))
+        session_b = create_session_manager().get_or_create("chat_back_002", str(_BACK_DIR))
         logger.info("\n>>> [Session B] 跨会话隔离追问")
         await _run_once(
             engine,
@@ -240,7 +237,7 @@ async def demo_plan_mode(prompt: str) -> None:
     Path(work_dir).mkdir(parents=True, exist_ok=True)
 
     llm_provider = OpenAIProvider.from_zhipu("glm-4.6v")
-    registry = new_registry()
+    registry = ToolRegistry()
 
     # 挂载四大基础工具
     registry.register(ReadFileTool(work_dir))
@@ -257,7 +254,7 @@ async def demo_plan_mode(prompt: str) -> None:
     )
     reporter = TerminalReporter()
 
-    session = global_session_mgr.get_or_create(_PLAN_SESSION_ID, work_dir)
+    session = create_session_manager().get_or_create(_PLAN_SESSION_ID, work_dir)
 
     logger.info("\n>>> 🚀 收到指令: %s", prompt)
     session.append(Message(role=Role.USER, content=prompt))
@@ -272,10 +269,10 @@ async def demo_recovery() -> None:
     """陷阱指令直接 edit_file，诱发 old_text 不匹配后 Recovery 纠偏。"""
     _require_api_key()
     work_dir = _workspace_dir()
-    registry = new_registry()
+    registry = ToolRegistry()
     _register_basic_tools(registry, work_dir)
     engine = _new_engine(_new_provider(), registry)
-    session = global_session_mgr.get_or_create("test_recovery_001", work_dir)
+    session = create_session_manager().get_or_create("test_recovery_001", work_dir)
     prompt = dedent(
         """
         我当前目录下有一个 auth.py 文件。
@@ -301,12 +298,14 @@ async def demo_recovery() -> None:
 def demo_feishu_approval() -> None:
     """飞书 WS + Middleware 审批卡片。阻塞主线程，勿与其它 asyncio 演示同开。"""
     import lark_oapi as lark
-    from internal.feishu.approval import global_approval_mgr, is_dangerous_command
+    from internal.feishu.approval import create_approval_manager, is_dangerous_command
     from internal.feishu.bot import FeishuBot, reporter_from_context
 
     _require_api_key()
     work_dir = _workspace_dir()
-    registry = new_registry()
+    session_mgr = create_session_manager()
+    approval_mgr = create_approval_manager()
+    registry = ToolRegistry()
     _register_basic_tools(registry, work_dir)
     base_provider = _new_provider()
 
@@ -315,13 +314,19 @@ def demo_feishu_approval() -> None:
         tracked = CostTracker(base_provider, _MODEL, session)
         return _new_engine(tracked, registry, approval_gate=True)
 
-    bot = FeishuBot(_factory, work_dir=work_dir)
+    bot = FeishuBot(
+        _factory,
+        work_dir=work_dir,
+        session_mgr=session_mgr,
+        approval_mgr=approval_mgr,
+    )
 
     def _approval_middleware(call: ToolCall) -> tuple[bool, str]:
         args_str = _args_to_str(call.arguments)
         if is_dangerous_command(call.name, args_str):
             # 从 Context 取本请求专属 Reporter，避免并发覆盖
-            allowed, reason = global_approval_mgr.wait_for_approval(
+            # 与 Bot 共享同一 approval_mgr，口令/卡片才能唤醒挂起协程
+            allowed, reason = approval_mgr.wait_for_approval(
                 call.id,
                 call.name,
                 args_str,
@@ -352,16 +357,16 @@ async def demo_subagent() -> None:
     work_dir = _workspace_dir()
     reporter = TerminalReporter()
 
-    read_only = new_registry()
+    read_only = ToolRegistry()
     read_only.register(ReadFileTool(work_dir))
     read_only.register(BashTool(work_dir))
 
-    main_registry = new_registry()
+    main_registry = ToolRegistry()
     _register_basic_tools(main_registry, work_dir)
     engine = _new_engine(_new_provider(), main_registry)
     main_registry.register(SubagentTool(engine, read_only, reporter))
 
-    session = global_session_mgr.get_or_create("test_subagent_001", work_dir)
+    session = create_session_manager().get_or_create("test_subagent_001", work_dir)
     prompt = dedent(
         """
         我需要你在这个遗留项目里，找到那个“核心密码”。
@@ -384,10 +389,10 @@ async def demo_observability() -> None:
     work_dir = str(Path.cwd())  # 仅 date，不必进 workspace
 
     real_provider = _new_provider()
-    session = global_session_mgr.get_or_create("test_observability_001", work_dir)
+    session = create_session_manager().get_or_create("test_observability_001", work_dir)
     tracked = CostTracker(real_provider, _MODEL, session)
 
-    registry = new_registry()
+    registry = ToolRegistry()
     registry.register(BashTool(work_dir))
     engine = _new_engine(tracked, registry)
 
@@ -415,14 +420,14 @@ async def demo_trace() -> None:
     _require_api_key()
     work_dir = _workspace_dir()
 
-    registry = new_registry()
+    registry = ToolRegistry()
     # 仅挂 bash + write_file
     registry.register(BashTool(work_dir))
     registry.register(WriteFileTool(work_dir))
 
     engine = _new_engine(_new_provider(), registry)
     reporter = TerminalReporter()
-    session = global_session_mgr.get_or_create("test_trace_001", work_dir)
+    session = create_session_manager().get_or_create("test_trace_001", work_dir)
 
     # 触发跨工具类型任务（引擎对含 bash/写操作会串行；Trace 仍会挂多个 Tool.Execute）
     prompt = dedent(
@@ -459,9 +464,9 @@ def main() -> None:
         # asyncio.run(demo_observability())      # 账单仪表盘
 
         asyncio.run(demo_trace())                # Tracing 链路追踪
-    except Exception:
+    except Exception as err:
         logger.exception("引擎运行崩溃")
-        raise SystemExit(1) from None
+        raise SystemExit(1) from err
 
 
 if __name__ == "__main__":

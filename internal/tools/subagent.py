@@ -118,5 +118,15 @@ def new_subagent_tool(
     read_only_registry: Registry,
     reporter: Any | None = None,
 ) -> SubagentTool:
-    """构造 SubagentTool"""
+    """构造 SubagentTool。
+
+    已废弃：请直接使用 ``SubagentTool(...)``。
+    """
+    import warnings
+
+    warnings.warn(
+        "new_subagent_tool() 已废弃，请改用 SubagentTool(...)",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return SubagentTool(runner, read_only_registry, reporter)

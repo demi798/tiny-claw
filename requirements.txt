@@ -1,4 +1,5 @@
-# tiny-claw 运行依赖（Python 3.10+）
+# 推荐：pip install -e ".[dev]"（以 pyproject.toml 为准）
+# 以下为运行依赖摘要，便于快速查阅
 openai>=1.0.0
 anthropic>=0.40.0
 python-dotenv>=1.0.0

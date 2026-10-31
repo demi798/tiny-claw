@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-claw"
+version = "0.1.0"
+description = "微型编码 Agent（Python 实现）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "openai>=1.0.0",
+    "anthropic>=0.40.0",
+    "python-dotenv>=1.0.0",
+    "lark-oapi>=1.4.0",
+    "flask>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+# 开发检查推荐命令（需先：pip install -e ".[dev]"）：
+#   ruff check internal cmd tests
+#   mypy internal
+#   pytest
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["internal*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.10"
+explicit_package_bases = true
+mypy_path = "."
+ignore_missing_imports = true
+packages = ["internal"]
+warn_unused_ignores = true
+show_error_codes = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+src = ["internal", "cmd", "tests"]
+
+[tool.ruff.lint]
+# 中文注释中的全角标点不视为歧义字符
+ignore = ["RUF001", "RUF002", "RUF003"]

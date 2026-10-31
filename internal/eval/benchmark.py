@@ -18,7 +18,7 @@ from internal.schema.message import Message, Role
 from internal.tools.bash import BashTool
 from internal.tools.edit_file import EditFileTool
 from internal.tools.read_file import ReadFileTool
-from internal.tools.registry import new_registry
+from internal.tools.registry import ToolRegistry
 from internal.tools.write_file import WriteFileTool
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,11 @@ class BenchmarkRunner:
 
     def __init__(self, model_name: str) -> None:
         self._model_name = model_name
+
+    @classmethod
+    def from_model(cls, model: str) -> BenchmarkRunner:
+        """按模型名构造跑分器。"""
+        return cls(model)
 
     async def run_suite(self, testcases: list[TestCase]) -> list[TestResult]:
         """执行一组评测集，打印终极报告，并返回各用例结果。"""
@@ -131,7 +136,7 @@ class BenchmarkRunner:
         session = Session(id=tc.id, work_dir=work_dir)
         tracked_provider = CostTracker(real_provider, self._model_name, session)
 
-        registry = new_registry()
+        registry = ToolRegistry()
         registry.register(ReadFileTool(work_dir))
         registry.register(WriteFileTool(work_dir))
         registry.register(BashTool(work_dir))
@@ -186,8 +191,18 @@ class BenchmarkRunner:
 
 
 def new_benchmark_runner(model: str) -> BenchmarkRunner:
-    """构造 BenchmarkRunner。"""
-    return BenchmarkRunner(model)
+    """构造 BenchmarkRunner。
+
+    已废弃：请改用 ``BenchmarkRunner.from_model(model)`` 或 ``BenchmarkRunner(model)``。
+    """
+    import warnings
+
+    warnings.warn(
+        "new_benchmark_runner() 已废弃，请改用 BenchmarkRunner.from_model()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return BenchmarkRunner.from_model(model)
 
 
 def _elapsed_ms(start: float) -> int:

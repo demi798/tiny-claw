@@ -7,23 +7,15 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
 import lark_oapi as lark
 from dotenv import load_dotenv
 
-_ROOT = Path(__file__).resolve().parents[2]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-load_dotenv(_ROOT / ".env")
-load_dotenv()
-
 from internal.engine.loop import AgentEngine
-from internal.engine.session import Session
-from internal.feishu.approval import global_approval_mgr, is_dangerous_command
+from internal.engine.session import Session, create_session_manager
+from internal.feishu.approval import create_approval_manager, is_dangerous_command
 from internal.feishu.bot import FeishuBot, reporter_from_context
 from internal.observability.tracker import CostTracker
 from internal.provider.openai import OpenAIProvider
@@ -31,8 +23,13 @@ from internal.schema.message import ToolCall
 from internal.tools.bash import BashTool
 from internal.tools.edit_file import EditFileTool
 from internal.tools.read_file import ReadFileTool
-from internal.tools.registry import new_registry
+from internal.tools.registry import ToolRegistry
 from internal.tools.write_file import WriteFileTool
+
+# 从仓库根目录加载 .env（需先 pip install -e .）
+_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_ROOT / ".env")
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,15 +64,17 @@ def main() -> None:
     work_dir = str(Path.cwd() / "workspace")
     Path(work_dir).mkdir(parents=True, exist_ok=True)
 
-    # 2. 初始化底层大脑与注册表
+    # 2. 初始化底层大脑与注册表（入口显式构造，注入 Bot / Middleware）
     llm_provider = OpenAIProvider.from_zhipu(_MODEL)
-    registry = new_registry()
+    session_mgr = create_session_manager()
+    approval_mgr = create_approval_manager()
+    registry = ToolRegistry()
     registry.register(ReadFileTool(work_dir))
     registry.register(WriteFileTool(work_dir))
     registry.register(EditFileTool(work_dir))
     registry.register(BashTool(work_dir))  # 必备的运维工具
 
-    # 3. 【核心防御】：注入安全拦截 Middleware
+    # 3. 【核心防御】：注入安全拦截 Middleware（与 Bot 共享同一 approval_mgr）
     def _approval_middleware(call: ToolCall) -> tuple[bool, str]:
         args_str = _args_to_str(call.arguments)
 
@@ -91,7 +90,7 @@ def main() -> None:
             current_reporter = reporter_from_context()
 
             # 当前线程挂起，向飞书发送卡片，等待人类决定
-            allowed, reason = global_approval_mgr.wait_for_approval(
+            allowed, reason = approval_mgr.wait_for_approval(
                 task_id,
                 call.name,
                 args_str,
@@ -121,7 +120,12 @@ def main() -> None:
         )
 
     # 5. 初始化飞书 Bot 调度中心（长连接模式：encrypt_key / verify_token 传空）
-    bot = FeishuBot(engine_factory, work_dir=work_dir)
+    bot = FeishuBot(
+        engine_factory,
+        work_dir=work_dir,
+        session_mgr=session_mgr,
+        approval_mgr=approval_mgr,
+    )
     event_handler = bot.get_event_dispatcher(use_long_connection=True)
 
     # 6. 启动 WebSocket 长连接（阻塞主线程；无需 ngrok / HTTP 公网回调）

@@ -7,19 +7,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-_ROOT = Path(__file__).resolve().parents[2]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from internal.eval.benchmark import BenchmarkRunner, TestCase
 
+# 从仓库根目录加载 .env（需先 pip install -e .）
+_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(_ROOT / ".env")
 load_dotenv()
-
-from internal.eval.benchmark import TestCase, new_benchmark_runner
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,16 +75,16 @@ async def _async_main() -> None:
         raise SystemExit("请先设置 ZHIPU_API_KEY 环境变量进行跑分测试")
 
     testcases = _build_testcases()
-    runner = new_benchmark_runner(_BENCH_MODEL)
+    runner = BenchmarkRunner.from_model(_BENCH_MODEL)
     await runner.run_suite(testcases)
 
 
 def main() -> None:
     try:
         asyncio.run(_async_main())
-    except Exception:
+    except Exception as err:
         logger.exception("Benchmark 运行崩溃")
-        raise SystemExit(1) from None
+        raise SystemExit(1) from err
 
 
 if __name__ == "__main__":

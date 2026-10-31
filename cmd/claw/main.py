@@ -8,21 +8,13 @@ import argparse
 import asyncio
 import logging
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-_ROOT = Path(__file__).resolve().parents[2]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-load_dotenv(_ROOT / ".env")
-load_dotenv()
-
 from internal.engine.loop import AgentEngine
-from internal.engine.session import global_session_mgr
+from internal.engine.session import create_session_manager
 from internal.engine.terminal_reporter import TerminalReporter
 from internal.observability.trace import export_trace_to_file, start_span
 from internal.observability.tracker import CostTracker
@@ -31,8 +23,13 @@ from internal.schema.message import Message, Role
 from internal.tools.bash import BashTool
 from internal.tools.edit_file import EditFileTool
 from internal.tools.read_file import ReadFileTool
-from internal.tools.registry import new_registry
+from internal.tools.registry import ToolRegistry
 from internal.tools.write_file import WriteFileTool
+
+# 从仓库根目录加载 .env（需先 pip install -e .）
+_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_ROOT / ".env")
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,15 +75,16 @@ async def _async_main(prompt: str, work_dir: str, session_id: str) -> None:
     print(f"📁 锁定工作区: {work_dir}")
     print("==================================================")
 
-    # 2. 初始化核心基础服务
+    # 2. 初始化核心基础服务（入口显式构造 SessionManager，不依赖模块单例）
     real_provider = OpenAIProvider.from_zhipu(_MODEL)
-    sess = global_session_mgr.get_or_create(session_id, work_dir)
+    session_mgr = create_session_manager()
+    sess = session_mgr.get_or_create(session_id, work_dir)
 
     # 【全息监控装配】：用 CostTracker 包裹真实 Provider
     tracked_provider = CostTracker(real_provider, _MODEL, sess)
 
     # 3. 初始化工具与执行层
-    registry = new_registry()
+    registry = ToolRegistry()
     registry.register(ReadFileTool(work_dir))
     registry.register(WriteFileTool(work_dir))
     registry.register(BashTool(work_dir))
@@ -136,9 +134,9 @@ def main() -> None:
 
     try:
         asyncio.run(_async_main(args.prompt, work_dir, args.session))
-    except Exception:
+    except Exception as err:
         logger.exception("引擎运行崩溃")
-        raise SystemExit(1) from None
+        raise SystemExit(1) from err
 
 
 if __name__ == "__main__":

@@ -1,17 +1,10 @@
-"""schema 包对外导出。"""
+"""tools 包对外导出。"""
 
-from internal.schema.message import (
-    Message,
-    Role,
-    ToolCall,
-    ToolDefinition,
-    ToolResult,
-)
+from internal.tools.registry import BaseTool, Registry, ToolRegistry, new_registry
 
 __all__ = [
-    "Message",
-    "Role",
-    "ToolCall",
-    "ToolDefinition",
-    "ToolResult",
+    "BaseTool",
+    "Registry",
+    "ToolRegistry",
+    "new_registry",  # 兼容别名，已废弃
 ]

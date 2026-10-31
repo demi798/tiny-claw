@@ -28,10 +28,11 @@ from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from dotenv import load_dotenv
 
 from internal.engine.reporter import Reporter
-from internal.engine.session import Session, global_session_mgr
+from internal.engine.session import Session, SessionManager, create_session_manager
 from internal.feishu.approval import (
+    ApprovalManager,
     build_approval_card,
-    global_approval_mgr,
+    create_approval_manager,
 )
 from internal.schema.message import Message, Role
 
@@ -82,6 +83,8 @@ class FeishuBot:
         factory: AgentEngineFactory,
         *,
         work_dir: str | None = None,
+        session_mgr: SessionManager | None = None,
+        approval_mgr: ApprovalManager | None = None,
     ) -> None:
         app_id = os.getenv("FEISHU_APP_ID", "").strip()
         app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
@@ -95,6 +98,9 @@ class FeishuBot:
         # 会话工作区：默认 cwd/workspace，与 CLI 约定一致
         self.work_dir = work_dir or str(Path.cwd() / "workspace")
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
+        # 由入口注入；未传则各自新建（Middleware 须与 Bot 共用同一 approval_mgr）
+        self.session_mgr = session_mgr or create_session_manager()
+        self.approval_mgr = approval_mgr or create_approval_manager()
         # 实例化飞书官方客户端，用于主动发消息
         self.client = (
             lark.Client.builder()
@@ -154,7 +160,7 @@ class FeishuBot:
         # 【新增】拦截人工审批的特殊口令，唤醒挂起的引擎协程
         if content_str.startswith("approve "):
             task_id = content_str.removeprefix("approve ").strip()
-            global_approval_mgr.resolve_approval(
+            self.approval_mgr.resolve_approval(
                 task_id,
                 True,
                 "人类管理员已批准操作",
@@ -164,7 +170,7 @@ class FeishuBot:
 
         if content_str.startswith("reject "):
             task_id = content_str.removeprefix("reject ").strip()
-            global_approval_mgr.resolve_approval(
+            self.approval_mgr.resolve_approval(
                 task_id,
                 False,
                 "人类管理员认为该操作存在极高风险，已无情拒绝",
@@ -207,7 +213,7 @@ class FeishuBot:
             if allowed
             else "人类管理员认为该操作存在极高风险，已无情拒绝"
         )
-        global_approval_mgr.resolve_approval(task_id, allowed, reason)
+        self.approval_mgr.resolve_approval(task_id, allowed, reason)
         logger.info(
             "[Feishu] 卡片审批 TaskID=%s allowed=%s",
             task_id,
@@ -257,7 +263,7 @@ class FeishuBot:
         token = context_with_reporter(reporter)
         try:
             # 1. 按 chat_id 物理隔离 Session
-            session = global_session_mgr.get_or_create(chat_id, self.work_dir)
+            session = self.session_mgr.get_or_create(chat_id, self.work_dir)
             session.append(Message(role=Role.USER, content=prompt))
 
             # 2. 工厂为当前会话生成挂好专属 CostTracker 等的新引擎

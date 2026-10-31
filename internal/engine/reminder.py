@@ -116,7 +116,17 @@ class ReminderInjector:
 
 
 def new_reminder_injector() -> ReminderInjector:
-    """构造 ReminderInjector"""
+    """构造 ReminderInjector。
+
+    已废弃：请直接使用 ``ReminderInjector()``。
+    """
+    import warnings
+
+    warnings.warn(
+        "new_reminder_injector() 已废弃，请改用 ReminderInjector()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return ReminderInjector()
 
 

@@ -234,11 +234,16 @@ class SessionManager:
             existing = self._sessions.get(session_id)
             if existing is not None:
                 return existing
-                
+
             sess = Session(id=session_id, work_dir=work_dir)
             self._sessions[session_id] = sess
             return sess
 
 
-# 模块级单例
+def create_session_manager() -> SessionManager:
+    """显式工厂：入口应调用本函数并注入，避免测试与多入口互相串扰。"""
+    return SessionManager()
+
+
+# 兼容旧调用的默认实例；新代码请改用 create_session_manager() 并注入
 global_session_mgr = SessionManager()

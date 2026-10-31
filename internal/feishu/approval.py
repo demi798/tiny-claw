@@ -57,12 +57,15 @@ class ApprovalManager:
         with self._mu:
             self._pending_tasks[task_id] = ch
 
-        # 2. 终端始终打印一份，避免飞书发送失败时用户完全看不到 TaskID
-        print(
-            f"\n\033[31m[需要审批 TaskID: {task_id}]\033[0m "
-            f"工具={tool_name} 参数={args}\n"
-            f"请在飞书卡片点击「通过/拒绝」，"
-            f'或回复 "approve {task_id}" / "reject {task_id}"\n'
+        # 2. 终端日志始终留一份，避免飞书发送失败时用户完全看不到 TaskID
+        logger.warning(
+            "[需要审批 TaskID: %s] 工具=%s 参数=%s；"
+            "请在飞书卡片点击「通过/拒绝」，或回复 \"approve %s\" / \"reject %s\"",
+            task_id,
+            tool_name,
+            args,
+            task_id,
+            task_id,
         )
 
         # 3. 发送带按钮的交互卡片
@@ -266,5 +269,10 @@ def _dispatch_approval_card(
         logger.info("[Approval] 飞书审批卡片已发送")
 
 
-# 全局单例，方便在 Registry Middleware 与 Feishu Webhook 之间共享状态
+def create_approval_manager() -> ApprovalManager:
+    """显式工厂：入口构造后注入 Bot 与 Middleware，保证二者共享同一实例。"""
+    return ApprovalManager()
+
+
+# 兼容旧调用的默认实例；新代码请改用 create_approval_manager() 并注入
 global_approval_mgr = ApprovalManager()
